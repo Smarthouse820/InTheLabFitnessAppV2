@@ -894,26 +894,47 @@ function generateCustomPlan(likedNames, source, slots) {
   }
   const results = [];
   useSlots.forEach(function (slot, i) {
-    const protein = proteins[i % proteins.length];
-    const carb = carbs[i % carbs.length];
-    const fat = fats[i % fats.length];
     const vegFood = veg.length > 0 ? veg[i % veg.length] : null;
     let target = [slot.p, slot.c, slot.f];
     let vegNote = null;
     if (vegFood) {
-      const vp = (vegFood.p * 100) / 100, vc = (vegFood.c * 100) / 100, vf = (vegFood.f * 100) / 100; // 100g fixed serving
+      const vp = vegFood.p, vc = vegFood.c, vf = vegFood.f; // 100g fixed serving
       target = [slot.p - vp, slot.c - vc, slot.f - vf];
       vegNote = { name: vegFood.name, grams: 100 };
     }
-    const grams = solve3x3([protein, carb, fat], target);
-    if (!grams) {
-      results.push({ slot: slot.label, error: "This combination of " + protein.name + " / " + carb.name + " / " + fat.name + " can't hit this meal's targets — try liking a different fat or carb source." });
+
+    // Try the "expected" round-robin pick first (keeps meals varied when it already works), then
+    // search every other liked combination before giving up. A single infeasible pick shouldn't
+    // fail the meal when there are a dozen other liked foods that might solve it just fine —
+    // the old code only ever tried one fixed combination per slot.
+    function ordered(list, idx) {
+      const first = list[idx % list.length];
+      return [first].concat(list.filter(function (_, k) { return k !== idx % list.length; }));
+    }
+    const proteinOrder = ordered(proteins, i);
+    const carbOrder = ordered(carbs, i);
+    const fatOrder = ordered(fats, i);
+
+    let solved = null, usedProtein = null, usedCarb = null, usedFat = null;
+    for (let pi = 0; pi < proteinOrder.length && !solved; pi++) {
+      for (let ci = 0; ci < carbOrder.length && !solved; ci++) {
+        for (let fi = 0; fi < fatOrder.length && !solved; fi++) {
+          const attempt = solve3x3([proteinOrder[pi], carbOrder[ci], fatOrder[fi]], target);
+          if (attempt) {
+            solved = attempt; usedProtein = proteinOrder[pi]; usedCarb = carbOrder[ci]; usedFat = fatOrder[fi];
+          }
+        }
+      }
+    }
+
+    if (!solved) {
+      results.push({ slot: slot.label, error: "None of your liked foods (in any combination) can hit this meal's targets — try liking a different fat or carb source." });
       return;
     }
     const items = [
-      { name: protein.name, grams: grams[0] },
-      { name: carb.name, grams: grams[1] },
-      { name: fat.name, grams: grams[2] },
+      { name: usedProtein.name, grams: solved[0] },
+      { name: usedCarb.name, grams: solved[1] },
+      { name: usedFat.name, grams: solved[2] },
     ];
     if (vegNote) items.push(vegNote);
     let cal = 0, p = 0, c = 0, f = 0;
