@@ -2011,9 +2011,7 @@ function WorkoutsTab(props) {
       day.cardio && h("span", null, day.cardio)
     ),
     day.cardio && props.targetHR && h("div", { className: "plan-error", style: { marginBottom: 12 } },
-      h("strong", null, "Target heart rate for fat-burning: ~" + props.targetHR + " bpm"),
-      h("p", { style: { margin: "4px 0 0", fontSize: "12px" } },
-        "Estimated as (220 − age) × 65% — a commonly used guideline, not a precise measurement. Aim to keep your heart rate near this level during cardio, not as a hard ceiling.")
+      h("strong", null, "Target heart rate for fat-burning: ~" + props.targetHR + " bpm")
     ),
     isRest
       ? h("div", { className: "rest-box" }, "No cardio, no lifting.")
