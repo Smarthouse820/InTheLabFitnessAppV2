@@ -89,6 +89,14 @@
 
   .ex-list { display: flex; flex-direction: column; gap: 8px; }
   .ex-card { background: #171717; border-radius: 12px; border: 1px solid #262626; overflow: hidden; }
+  .superset-group { border: 2px solid #8b5cf6; border-radius: 14px; padding: 10px; display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+  .superset-group .ex-card { margin-bottom: 0; }
+  .superset-label { display: flex; justify-content: space-between; align-items: center; padding: 0 4px;
+    font-size: 12px; font-weight: 600; color: #8b5cf6; text-transform: uppercase; letter-spacing: 0.03em; }
+  .superset-ungroup-btn { background: none; border: 1px solid #8b5cf6; color: #8b5cf6; border-radius: 6px;
+    font-size: 11px; padding: 4px 8px; cursor: pointer; text-transform: none; letter-spacing: normal; font-weight: 500; }
+  .superset-select-row { display: flex; align-items: center; gap: 8px; padding: 10px 14px; background: rgba(139,92,246,0.1);
+    font-size: 13px; color: #e0d4ff; }
   .ex-head { width: 100%; display: flex; align-items: center; justify-content: space-between; padding: 12px 16px;
     text-align: left; background: none; border: none; color: inherit; cursor: pointer; }
   .ex-name { font-size: 14px; font-weight: 500; }
@@ -1241,6 +1249,7 @@ function freshProgramState(exercises) {
     skipped: {}, customMealOverrides: {}, undoSnapshot: null, exerciseDifficulty: {}, foodLog: {},
     sleepLogs: {},
     dailyWeightLogs: {},
+    supersetGroups: {}, // { [day]: [[exId, exId, ...], ...] } — persists per day, independent of week
     extraDeloadWeeks: [], deloadRecommendation: null,
     nutritionDayComplete: {},
     hydrationDayComplete: {},
@@ -1310,7 +1319,7 @@ function loadData() {
 }
 
 function App() {
-  const APP_VERSION = "2026-07-16T04:17:23";
+  const APP_VERSION = "2026-07-16T11:41:09";
   const [updateAvailable, setUpdateAvailable] = useState(false);
   useEffect(function () {
     function checkVersion() {
@@ -1792,6 +1801,19 @@ function App() {
     saveProgram({ exerciseState: newState });
   }
 
+  function createSuperset(day, exerciseIds) {
+    const cur = prog.supersetGroups[day] || [];
+    const newGroups = Object.assign({}, prog.supersetGroups);
+    newGroups[day] = cur.concat([exerciseIds]);
+    saveProgram({ supersetGroups: newGroups });
+  }
+  function removeSuperset(day, groupIndex) {
+    const cur = prog.supersetGroups[day] || [];
+    const newGroups = Object.assign({}, prog.supersetGroups);
+    newGroups[day] = cur.filter(function (_, i) { return i !== groupIndex; });
+    saveProgram({ supersetGroups: newGroups });
+  }
+
   function toggleLikedFood(name) {
     const cur = data.likedFoods || [];
     const next = cur.indexOf(name) !== -1 ? cur.filter(function (n) { return n !== name; }) : cur.concat([name]);
@@ -1911,6 +1933,7 @@ function App() {
               toggleSkip: toggleSkip, setSwap: setSwap, clearSwap: clearSwap, undoCompleteWeek: undoCompleteWeek, updateExerciseNote: updateExerciseNote,
               setExerciseDifficulty: setExerciseDifficulty, color: def.color,
               targetHR: (data.customProgramConfig && data.customProgramConfig.age) ? Math.round((220 - data.customProgramConfig.age) * 0.65) : null,
+              supersetGroups: prog.supersetGroups, createSuperset: createSuperset, removeSuperset: removeSuperset,
               deloadRecommendation: prog.deloadRecommendation, acceptDeloadRecommendation: acceptDeloadRecommendation,
               dismissDeloadRecommendation: dismissDeloadRecommendation,
             }),
@@ -1990,7 +2013,10 @@ function isDayFullyComplete(dayExercises, isDeloadWeek, weekLogs, weekSkipped, w
 function WorkoutsTab(props) {
   const [swapOpen, setSwapOpen] = useState({});
   const [historyOpen, setHistoryOpen] = useState({});
+  const [groupingMode, setGroupingMode] = useState(false);
+  const [pendingSelection, setPendingSelection] = useState([]);
   const day = props.exercises[props.selectedDay];
+  useEffect(function () { setGroupingMode(false); setPendingSelection([]); }, [props.selectedDay]);
   const isRest = day.exercises.length === 0;
   const weekLogs = props.data.logs[props.data.currentWeek] || {};
   const weekSkipped = props.data.skipped[props.data.currentWeek] || {};
@@ -2008,6 +2034,151 @@ function WorkoutsTab(props) {
     return { completed: completed, inProgress: started && !completed };
   });
   const anyInProgressIdx = statuses.findIndex(function (s) { return s.inProgress; });
+
+  // Extracted so both a normal single card and a superset-wrapped card render identically —
+  // grouping is purely a visual/organizational layer on top of this, nothing about logging,
+  // history, notes, or swapping changes based on whether an exercise is in a superset.
+  function renderCard(ex, idx) {
+    const state = props.data.exerciseState[ex.id] || { weight: ex.weight, repsTarget: ex.repLow, nameOverride: null };
+    const range = effectiveRepRange(ex, state);
+    const setsToday = props.isDeloadWeek ? Math.ceil(ex.sets / 2) : ex.sets;
+    const logsForEx = weekLogs[ex.id] || [];
+    const loggedCount = logsForEx.filter(Boolean).length;
+    const isSkipped = !!weekSkipped[ex.id];
+    const isSwapOpen = !!swapOpen[ex.id];
+    const isHistoryOpen = !!historyOpen[ex.id];
+    const displayName = state.nameOverride || ex.name;
+    const rating = weekDifficulty[ex.id];
+    const readyToRate = !isSkipped && allSetsHaveReps(logsForEx, setsToday);
+    const isOpen = !!props.expanded[ex.id];
+    const status = statuses[idx];
+    const canEnter = status.completed || status.inProgress || anyInProgressIdx === -1;
+    const blockedBy = !canEnter ? (props.data.exerciseState[day.exercises[anyInProgressIdx].id].nameOverride || day.exercises[anyInProgressIdx].name) : null;
+    const isSelected = pendingSelection.indexOf(ex.id) !== -1;
+
+    return h("div", { key: ex.id, className: "ex-card" + (!canEnter ? " locked" : "") },
+      groupingMode && h("label", { className: "superset-select-row" },
+        h("input", {
+          type: "checkbox", checked: isSelected,
+          onChange: function () {
+            setPendingSelection(function (cur) {
+              return isSelected ? cur.filter(function (id) { return id !== ex.id; }) : cur.concat([ex.id]);
+            });
+          },
+        }),
+        h("span", null, "Include in superset")
+      ),
+      h("button", {
+        className: "ex-head",
+        onClick: function () {
+          const next = Object.assign({}, props.expanded);
+          next[ex.id] = !next[ex.id];
+          props.setExpanded(next);
+        },
+      },
+        h("div", null,
+          h("div", { className: "ex-name" },
+            displayName, state.nameOverride && h("span", { className: "swap-tag" }, "  (swapped)")
+          ),
+          h("div", { className: "ex-meta" },
+            isSkipped
+              ? "Skipped this week"
+              : (ex.bodyweight ? "Bodyweight" : state.weight + "lb") + " · " + setsToday + "×" +
+                (ex.isFailure ? "to failure (target " + state.repsTarget + ", range " + range.repLow + "–" + range.repHigh + ")" : state.repsTarget + " (range " + range.repLow + "–" + range.repHigh + ")"),
+            loggedCount > 0 && !isSkipped && h("span", { className: "done" }, " · " + loggedCount + "/" + setsToday + " logged"),
+            rating && h("span", { className: "rated-tag" + (rating === "hard" ? " hard" : "") },
+              " · Rated: " + (rating === "easy" ? "Easy" : rating === "right" ? "Just Right" : "Too Difficult")),
+            !canEnter && h("span", { className: "lock-hint" }, h(Lock, { size: 11 }), " Finish \"" + blockedBy + "\" first")
+          )
+        ),
+        isOpen ? h(ChevronUp, { size: 16 }) : h(ChevronDown, { size: 16 })
+      ),
+      isOpen && h("div", { className: "ex-body" },
+        h("div", { className: "ex-actions" },
+          !isSkipped && h("button", { className: "ex-action-btn", onClick: function () { props.toggleSkip(ex.id); } }, "Skip (out of time)"),
+          !isSkipped && canEnter && h("button", {
+            className: "ex-action-btn", onClick: function () {
+              const next = Object.assign({}, swapOpen);
+              next[ex.id] = !next[ex.id];
+              setSwapOpen(next);
+            },
+          }, state.nameOverride ? "Edit swap" : "Swap exercise"),
+          h("button", {
+            className: "ex-action-btn", onClick: function () {
+              const next = Object.assign({}, historyOpen);
+              next[ex.id] = !next[ex.id];
+              setHistoryOpen(next);
+            },
+          }, isHistoryOpen ? "Hide history" : "History"),
+          h("a", {
+            className: "ex-action-btn", target: "_blank", rel: "noopener noreferrer",
+            style: { textAlign: "center", textDecoration: "none", display: "block" },
+            href: "https://www.youtube.com/results?search_query=" + encodeURIComponent(ex.name + " exercise form"),
+          }, "Watch Demo")
+        ),
+        isHistoryOpen && h(ExerciseHistory, { exercise: ex, logs: props.data.logs, currentWeek: props.data.currentWeek, ratings: props.data.exerciseDifficulty, color: props.color }),
+        h(ExerciseNotes, { exerciseId: ex.id, notes: state.notes || "", onSave: props.updateExerciseNote }),
+        isSkipped
+          ? h("div", { className: "skip-banner" },
+              h("span", null, "Marked skipped for this week — won't affect next week's targets."),
+              h("button", { onClick: function () { props.toggleSkip(ex.id); } }, "Undo")
+            )
+          : !canEnter
+          ? h("div", { className: "skip-banner" },
+              h("span", null, "\"" + blockedBy + "\" is still in progress. Finish rating it, or skip it, before starting this one."))
+          : h(React.Fragment, null,
+              isSwapOpen && h(SwapForm, {
+                exercise: ex, current: state,
+                onSave: function (name, weight, newRepRange) { props.setSwap(ex.id, name, weight, newRepRange); },
+                onClear: function () { props.clearSwap(ex.id); },
+              }),
+              Array.from({ length: setsToday }).map(function (_, i) {
+                return h(SetLogger, {
+                  key: props.data.currentWeek + "-" + i, setIdx: i, exercise: ex, state: state,
+                  existing: logsForEx[i], onLog: function (reps, weight) { props.logSet(ex.id, i, reps, weight); },
+                });
+              }),
+              readyToRate && h("div", { className: "rate-panel" },
+                h("p", null, rating ? "Change your rating for this exercise:" : "All sets logged — rate this exercise to free up starting a different one:"),
+                h("div", { className: "diff-row" },
+                  DIFFICULTIES.map(function (d) {
+                    return h("button", {
+                      key: d.id, onClick: function () { props.setExerciseDifficulty(ex.id, d.id); },
+                      className: "diff-btn" + (rating === d.id ? " " + d.cls : ""),
+                    }, d.label);
+                  })
+                )
+              )
+            )
+      )
+    );
+  }
+
+  // Groups this day's exercises into render units — either a standalone card, or a superset
+  // container wrapping several cards together. Grouping is purely organizational: each exercise
+  // inside a superset still renders through the exact same renderCard function above, so logging,
+  // swapping, history, and notes behave identically whether an exercise is grouped or not.
+  const dayGroups = (props.supersetGroups && props.supersetGroups[props.selectedDay]) || [];
+  const groupOf = {};
+  dayGroups.forEach(function (ids, gi) { ids.forEach(function (id) { groupOf[id] = gi; }); });
+  const seen = {};
+  const renderUnits = [];
+  day.exercises.forEach(function (ex, idx) {
+    if (seen[ex.id]) return;
+    if (groupOf[ex.id] != null) {
+      const gi = groupOf[ex.id];
+      const idsInGroup = dayGroups[gi];
+      const membersWithIdx = idsInGroup.map(function (id) {
+        const foundIdx = day.exercises.findIndex(function (e) { return e.id === id; });
+        return { ex: day.exercises[foundIdx], idx: foundIdx };
+      }).filter(function (m) { return m.ex; });
+      membersWithIdx.forEach(function (m) { seen[m.ex.id] = true; });
+      renderUnits.push({ type: "superset", groupIndex: gi, members: membersWithIdx });
+    } else {
+      seen[ex.id] = true;
+      renderUnits.push({ type: "single", ex: ex, idx: idx });
+    }
+  });
 
   return h("div", null,
     props.deloadRecommendation && props.deloadRecommendation.forWeek === props.data.currentWeek && h("div", { className: "preview-banner", style: { marginBottom: 16 } },
@@ -2031,116 +2202,34 @@ function WorkoutsTab(props) {
       day.cardio && h("span", null, day.cardio)
     ),
     day.cardio && props.targetHR && h("div", { className: "plan-error", style: { marginBottom: 12 } },
-      h("strong", null, "Target heart rate for fat-burning: ~" + props.targetHR + " bpm"),
-      h("p", { style: { margin: "4px 0 0", fontSize: "12px" } },
-        "Estimated as (220 − age) × 65% — a commonly used guideline, not a precise measurement. Aim to keep your heart rate near this level during cardio, not as a hard ceiling.")
+      h("strong", null, "Target heart rate for fat-burning: ~" + props.targetHR + " bpm")
+    ),
+    !isRest && h("div", { style: { display: "flex", gap: 8, marginBottom: 12 } },
+      !groupingMode
+        ? h("button", { className: "ex-action-btn", onClick: function () { setGroupingMode(true); setPendingSelection([]); } }, "Group Superset")
+        : h(React.Fragment, null,
+            h("button", { className: "ex-action-btn", onClick: function () { setGroupingMode(false); setPendingSelection([]); } }, "Cancel"),
+            h("button", {
+              className: "swap-save-btn", style: { flex: 1 },
+              disabled: pendingSelection.length < 2,
+              onClick: function () {
+                props.createSuperset(props.selectedDay, pendingSelection);
+                setGroupingMode(false); setPendingSelection([]);
+              },
+            }, "Confirm Superset (" + pendingSelection.length + " selected)")
+          )
     ),
     isRest
       ? h("div", { className: "rest-box" }, "No cardio, no lifting.")
       : h("div", { className: "ex-list" },
-          day.exercises.map(function (ex, idx) {
-            const state = props.data.exerciseState[ex.id] || { weight: ex.weight, repsTarget: ex.repLow, nameOverride: null };
-            const range = effectiveRepRange(ex, state);
-            const setsToday = props.isDeloadWeek ? Math.ceil(ex.sets / 2) : ex.sets;
-            const logsForEx = weekLogs[ex.id] || [];
-            const loggedCount = logsForEx.filter(Boolean).length;
-            const isSkipped = !!weekSkipped[ex.id];
-            const isSwapOpen = !!swapOpen[ex.id];
-            const isHistoryOpen = !!historyOpen[ex.id];
-            const displayName = state.nameOverride || ex.name;
-            const rating = weekDifficulty[ex.id];
-            const readyToRate = !isSkipped && allSetsHaveReps(logsForEx, setsToday);
-            const isOpen = !!props.expanded[ex.id];
-            const status = statuses[idx];
-            // Can enter/edit data for this exercise if: it's already completed (always editable),
-            // it's the one currently in progress, or nothing else is in progress right now.
-            const canEnter = status.completed || status.inProgress || anyInProgressIdx === -1;
-            const blockedBy = !canEnter ? (props.data.exerciseState[day.exercises[anyInProgressIdx].id].nameOverride || day.exercises[anyInProgressIdx].name) : null;
-
-            return h("div", { key: ex.id, className: "ex-card" + (!canEnter ? " locked" : "") },
-              h("button", {
-                className: "ex-head",
-                onClick: function () {
-                  const next = Object.assign({}, props.expanded);
-                  next[ex.id] = !next[ex.id];
-                  props.setExpanded(next);
-                },
-              },
-                h("div", null,
-                  h("div", { className: "ex-name" },
-                    displayName, state.nameOverride && h("span", { className: "swap-tag" }, "  (swapped)")
-                  ),
-                  h("div", { className: "ex-meta" },
-                    isSkipped
-                      ? "Skipped this week"
-                      : (ex.bodyweight ? "Bodyweight" : state.weight + "lb") + " · " + setsToday + "×" +
-                        (ex.isFailure ? "to failure (target " + state.repsTarget + ", range " + range.repLow + "–" + range.repHigh + ")" : state.repsTarget + " (range " + range.repLow + "–" + range.repHigh + ")"),
-                    loggedCount > 0 && !isSkipped && h("span", { className: "done" }, " · " + loggedCount + "/" + setsToday + " logged"),
-                    rating && h("span", { className: "rated-tag" + (rating === "hard" ? " hard" : "") },
-                      " · Rated: " + (rating === "easy" ? "Easy" : rating === "right" ? "Just Right" : "Too Difficult")),
-                    !canEnter && h("span", { className: "lock-hint" }, h(Lock, { size: 11 }), " Finish \"" + blockedBy + "\" first")
-                  )
-                ),
-                isOpen ? h(ChevronUp, { size: 16 }) : h(ChevronDown, { size: 16 })
+          renderUnits.map(function (unit) {
+            if (unit.type === "single") return renderCard(unit.ex, unit.idx);
+            return h("div", { key: "superset-" + unit.groupIndex, className: "superset-group" },
+              h("div", { className: "superset-label" },
+                h("span", null, "Superset"),
+                h("button", { className: "superset-ungroup-btn", onClick: function () { props.removeSuperset(props.selectedDay, unit.groupIndex); } }, "Ungroup")
               ),
-              isOpen && h("div", { className: "ex-body" },
-                h("div", { className: "ex-actions" },
-                  !isSkipped && h("button", { className: "ex-action-btn", onClick: function () { props.toggleSkip(ex.id); } }, "Skip (out of time)"),
-                  !isSkipped && canEnter && h("button", {
-                    className: "ex-action-btn", onClick: function () {
-                      const next = Object.assign({}, swapOpen);
-                      next[ex.id] = !next[ex.id];
-                      setSwapOpen(next);
-                    },
-                  }, state.nameOverride ? "Edit swap" : "Swap exercise"),
-                  h("button", {
-                    className: "ex-action-btn", onClick: function () {
-                      const next = Object.assign({}, historyOpen);
-                      next[ex.id] = !next[ex.id];
-                      setHistoryOpen(next);
-                    },
-                  }, isHistoryOpen ? "Hide history" : "History"),
-                  h("a", {
-                    className: "ex-action-btn", target: "_blank", rel: "noopener noreferrer",
-                    style: { textAlign: "center", textDecoration: "none", display: "block" },
-                    href: "https://www.youtube.com/results?search_query=" + encodeURIComponent(ex.name + " exercise form"),
-                  }, "Watch Demo")
-                ),
-                isHistoryOpen && h(ExerciseHistory, { exercise: ex, logs: props.data.logs, currentWeek: props.data.currentWeek, ratings: props.data.exerciseDifficulty, color: props.color }),
-                h(ExerciseNotes, { exerciseId: ex.id, notes: state.notes || "", onSave: props.updateExerciseNote }),
-                isSkipped
-                  ? h("div", { className: "skip-banner" },
-                      h("span", null, "Marked skipped for this week — won't affect next week's targets."),
-                      h("button", { onClick: function () { props.toggleSkip(ex.id); } }, "Undo")
-                    )
-                  : !canEnter
-                  ? h("div", { className: "skip-banner" },
-                      h("span", null, "\"" + blockedBy + "\" is still in progress. Finish rating it, or skip it, before starting this one."))
-                  : h(React.Fragment, null,
-                      isSwapOpen && h(SwapForm, {
-                        exercise: ex, current: state,
-                        onSave: function (name, weight, newRepRange) { props.setSwap(ex.id, name, weight, newRepRange); },
-                        onClear: function () { props.clearSwap(ex.id); },
-                      }),
-                      Array.from({ length: setsToday }).map(function (_, i) {
-                        return h(SetLogger, {
-                          key: props.data.currentWeek + "-" + i, setIdx: i, exercise: ex, state: state,
-                          existing: logsForEx[i], onLog: function (reps, weight) { props.logSet(ex.id, i, reps, weight); },
-                        });
-                      }),
-                      readyToRate && h("div", { className: "rate-panel" },
-                        h("p", null, rating ? "Change your rating for this exercise:" : "All sets logged — rate this exercise to free up starting a different one:"),
-                        h("div", { className: "diff-row" },
-                          DIFFICULTIES.map(function (d) {
-                            return h("button", {
-                              key: d.id, onClick: function () { props.setExerciseDifficulty(ex.id, d.id); },
-                              className: "diff-btn" + (rating === d.id ? " " + d.cls : ""),
-                            }, d.label);
-                          })
-                        )
-                      )
-                    )
-              )
+              unit.members.map(function (m) { return renderCard(m.ex, m.idx); })
             );
           })
         ),
