@@ -1319,7 +1319,7 @@ function loadData() {
 }
 
 function App() {
-  const APP_VERSION = "2026-07-16T11:41:09";
+  const APP_VERSION = "2026-07-17T15:00:51";
   const [updateAvailable, setUpdateAvailable] = useState(false);
   useEffect(function () {
     function checkVersion() {
@@ -1887,6 +1887,74 @@ function App() {
     showToast("Week " + week + " reverted to default meals");
   }
 
+  // Swaps just ONE food (protein, carb, or fat) within a single meal — e.g. "I don't want turkey
+  // in Meal 3 this week." Re-solves that meal's macros with the new food substituted in, keeping
+  // the other two components the same where possible. Stored as a per-week override, so it applies
+  // for the rest of the current week only — the following week reverts to the default plan, since
+  // Custom's meal plan is otherwise identical every week by design.
+  function swapMealIngredient(mealIndex, role, newFoodName) {
+    const newFood = allFoods.filter(function (f) { return f.name === newFoodName; })[0];
+    if (!newFood) return;
+    const slot = def.slots[mealIndex];
+    const currentMeal = meals[mealIndex];
+    const items = currentMeal.items;
+    const roleIdx = { protein: 0, carb: 1, fat: 2 }[role];
+    const vegItem = items[3] || null;
+    const vegFood = vegItem ? allFoods.filter(function (f) { return f.name === vegItem.name; })[0] : null;
+    const target = vegFood ? [slot.p - vegFood.p, slot.c - vegFood.c, slot.f - vegFood.f] : [slot.p, slot.c, slot.f];
+
+    const currentFoods = [0, 1, 2].map(function (i) { return allFoods.filter(function (f) { return f.name === items[i].name; })[0]; });
+    currentFoods[roleIdx] = newFood;
+
+    let solved = solve3x3(currentFoods, target);
+    let usedFoods = currentFoods;
+
+    if (!solved) {
+      // Direct substitution didn't solve — search the person's other liked foods for the two
+      // roles NOT being swapped, keeping the new food fixed in its role. Same fallback logic
+      // already proven in the initial plan generator.
+      const likedObjs = data.likedFoods.map(function (n) { return allFoods.filter(function (f) { return f.name === n; })[0]; }).filter(Boolean);
+      const pool = { protein: likedObjs.filter(function (f) { return f.cat === "protein"; }), carb: likedObjs.filter(function (f) { return f.cat === "carb"; }), fat: likedObjs.filter(function (f) { return f.cat === "fat"; }) };
+      const roles = ["protein", "carb", "fat"];
+      const options = roles.map(function (r, i) { return i === roleIdx ? [newFood] : pool[r]; });
+      outer:
+      for (let a = 0; a < options[0].length && !solved; a++) {
+        for (let b = 0; b < options[1].length && !solved; b++) {
+          for (let c = 0; c < options[2].length && !solved; c++) {
+            const attempt = solve3x3([options[0][a], options[1][b], options[2][c]], target);
+            if (attempt) { solved = attempt; usedFoods = [options[0][a], options[1][b], options[2][c]]; break outer; }
+          }
+        }
+      }
+    }
+
+    if (!solved) {
+      showToast("Couldn't fit that food into this meal's targets — try a different one.");
+      return;
+    }
+
+    const newItems = [
+      { name: usedFoods[0].name, grams: solved[0] },
+      { name: usedFoods[1].name, grams: solved[1] },
+      { name: usedFoods[2].name, grams: solved[2] },
+    ];
+    if (vegItem) newItems.push(vegItem);
+    let cal = 0, p = 0, c = 0, f = 0;
+    newItems.forEach(function (it) {
+      const food = allFoods.filter(function (f) { return f.name === it.name; })[0];
+      cal += (food.cal * it.grams) / 100; p += (food.p * it.grams) / 100; c += (food.c * it.grams) / 100; f += (food.f * it.grams) / 100;
+    });
+    const foodStr = newItems.map(function (it) { return formatMealItem(it, allFoods); }).join(" + ");
+    const newMealObj = { id: currentMeal.id, time: currentMeal.time, name: currentMeal.name, food: foodStr, cal: Math.round(cal), p: Math.round(p), c: Math.round(c), f: Math.round(f), items: newItems };
+
+    const currentWeek = prog.currentWeek;
+    const existingWeekOverride = prog.customMealOverrides[currentWeek] || {};
+    const newWeekOverride = Object.assign({}, existingWeekOverride, { [currentMeal.id]: newMealObj });
+    const newOverrides = Object.assign({}, prog.customMealOverrides, { [currentWeek]: newWeekOverride });
+    saveProgram({ customMealOverrides: newOverrides });
+    showToast("Swapped — applies for the rest of this week");
+  }
+
   return h("div", { className: "app" },
     updateAvailable && h("div", {
       style: { background: "#8b5cf6", color: "#fff", padding: "10px 16px", textAlign: "center", fontSize: "13px", cursor: "pointer" },
@@ -1946,6 +2014,7 @@ function App() {
               weekOffset: nutritionWeekOffset, setWeekOffset: setNutritionWeekOffset,
               dayIdx: nutritionDayIdx, setDayIdx: setNutritionDayIdx,
               selectedDate: nutritionSelectedDate, isToday: nutritionIsToday,
+              isCustomProgram: data.activeProgram === "custom", swapIngredient: swapMealIngredient, likedFoods: data.likedFoods,
             }),
             tab === "hydration" && h(HydrationTab, {
               hToday: hToday, toggleHydration: toggleHydration, ozLogged: ozLogged, hydrationHistory: hydrationHistory,
@@ -2804,6 +2873,33 @@ function WeekSelector(props) {
   );
 }
 
+// Lets someone swap out one part of a Custom-program meal (protein, carb, or fat) for a different
+// liked food — e.g. "no more turkey this week." Only shows options from the person's own liked-
+// foods list, since that's the pool the underlying solver draws from to recompute exact grams.
+function MealSwapControl(props) {
+  const [openRole, setOpenRole] = useState(null);
+  const catFoods = openRole ? props.allFoods.filter(function (f) { return f.cat === openRole && props.likedFoods.indexOf(f.name) !== -1; }) : [];
+  return h("div", { style: { marginTop: 10 } },
+    h("div", { style: { display: "flex", gap: 6 } },
+      ["protein", "carb", "fat"].map(function (role) {
+        return h("button", {
+          key: role, className: "ex-action-btn",
+          onClick: function () { setOpenRole(openRole === role ? null : role); },
+        }, "Swap " + role);
+      })
+    ),
+    openRole && h("select", {
+      className: "search-input", style: { marginTop: 6 }, value: "",
+      onChange: function (e) { if (e.target.value) { props.onSwap(openRole, e.target.value); setOpenRole(null); } },
+    },
+      h("option", { value: "" }, "Choose a " + openRole + "..."),
+      catFoods.map(function (f) { return h("option", { key: f.name, value: f.name }, f.name); })
+    ),
+    openRole && catFoods.length === 0 && h("p", { style: { fontSize: "11px", color: "#737373", marginTop: 4 } },
+      "No liked " + openRole + "s to swap in yet — add some in the Custom Plan tab first.")
+  );
+}
+
 function NutritionTab(props) {
   const STATUS_OPTS = [
     { id: "full", label: "Full" }, { id: "three_quarter", label: "¾", pct: 75 },
@@ -2857,7 +2953,7 @@ function NutritionTab(props) {
     !isFutureWeek && isFutureDay && h("div", { className: "preview-banner" }, "That's a future day — nothing to log yet."),
 
     h("div", { style: { marginBottom: 24 } },
-      props.meals.map(function (m) {
+      props.meals.map(function (m, idx) {
         const entry = props.nToday[m.id];
         const status = entry ? (entry.status === "partial" ? (entry.pct === 75 ? "three_quarter" : "half") : entry.status) : null;
         return h("div", { key: m.id, className: "meal-card" + (status && status !== "skip" ? " done" : "") + (isFutureDay ? " preview-disabled" : "") },
@@ -2876,7 +2972,11 @@ function NutritionTab(props) {
                   className: "diff-btn" + (active ? (opt.id === "skip" ? " hard" : " easy") : ""),
                 }, opt.label);
               })
-            )
+            ),
+            props.isCustomProgram && !isFutureWeek && !isFutureDay && h(MealSwapControl, {
+              allFoods: props.allFoods, likedFoods: props.likedFoods,
+              onSwap: function (role, foodName) { props.swapIngredient(idx, role, foodName); },
+            })
           )
         );
       })
