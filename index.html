@@ -720,12 +720,10 @@ function interpolateMealTimes(startStr, endStr, count) {
 // goal) and protein (~1g/lb) stay exactly the same regardless of style, since those are the two
 // pieces with the strongest evidence behind them either way. This also means the existing meal
 // solver needs no changes at all — it just receives a different fat/carb target to hit.
-function computeCustomMacros(weight, activity, goal, gender, heightCm, age, dietStyle) {
-  const weightKg = weight / 2.20462;
-  const bmr = gender === "male"
-    ? 10 * weightKg + 6.25 * heightCm - 5 * age + 5
-    : 10 * weightKg + 6.25 * heightCm - 5 * age - 161;
-  const maintenance = bmr * (MSJ_ACTIVITY_MULTIPLIER[activity] || 1.375);
+// Shared by the initial Mifflin-St Jeor estimate AND the adaptive-TDEE recalibration — both need
+// the exact same goal-adjustment and diet-style split logic applied to a maintenance-calorie number,
+// they just arrive at that number differently (estimated vs. measured from real weigh-ins).
+function macrosFromMaintenance(maintenance, weight, goal, dietStyle) {
   const targetCal = Math.round(maintenance * (GOAL_CAL_ADJUST[goal] || 1.0));
   const protein = Math.round(weight * 1.0); // ~1g/lb, standard evidence-based target used throughout this app
   let fat, carb;
@@ -743,6 +741,14 @@ function computeCustomMacros(weight, activity, goal, gender, heightCm, age, diet
     carb = Math.max(0, Math.round(carbCals / 4));
   }
   return { cal: targetCal, p: protein, c: carb, f: fat, maintenance: Math.round(maintenance) };
+}
+function computeCustomMacros(weight, activity, goal, gender, heightCm, age, dietStyle) {
+  const weightKg = weight / 2.20462;
+  const bmr = gender === "male"
+    ? 10 * weightKg + 6.25 * heightCm - 5 * age + 5
+    : 10 * weightKg + 6.25 * heightCm - 5 * age - 161;
+  const maintenance = bmr * (MSJ_ACTIVITY_MULTIPLIER[activity] || 1.375);
+  return macrosFromMaintenance(maintenance, weight, goal, dietStyle);
 }
 
 function computeWeeksNeeded(currentWeight, targetWeight, goal, maintenance, targetCal) {
@@ -1067,6 +1073,26 @@ const FOOD_DB = [
   { name: "Whey protein powder", cat: "protein", cal: 409, p: 83, c: 8, f: 5, micro: { calcium: 400 }, measureByScoop: true }, // ~25g protein per 30g scoop
   { name: "Deli turkey slices", cat: "protein", cal: 104, p: 17, c: 3, f: 2, micro: { selenium: 22, zinc: 1 } },
   { name: "Deli ham slices", cat: "protein", cal: 145, p: 21, c: 1.5, f: 6, micro: { selenium: 25, zinc: 1.8, iron: 0.8 } },
+  { name: "Cod", cat: "protein", cal: 82, p: 18, c: 0, f: 0.7, micro: { selenium: 33, vitaminD: 44 } },
+  { name: "Halibut", cat: "protein", cal: 111, p: 23, c: 0, f: 1.3, micro: { selenium: 47, vitaminD: 54 } },
+  { name: "Sardines (canned in oil)", cat: "protein", cal: 208, p: 25, c: 0, f: 11, micro: { calcium: 382, vitaminD: 193, selenium: 53 } },
+  { name: "Ground chicken", cat: "protein", cal: 143, p: 18, c: 0, f: 8, micro: { selenium: 22, zinc: 1.6 } },
+  { name: "Turkey bacon", cat: "protein", cal: 150, p: 12, c: 1, f: 10, micro: { selenium: 20 } },
+  { name: "Beef jerky", cat: "protein", cal: 410, p: 33, c: 11, f: 26, micro: { zinc: 5, iron: 3, selenium: 30 } },
+  { name: "Seitan", cat: "protein", cal: 370, p: 75, c: 14, f: 1.9, micro: { iron: 5, zinc: 1 } },
+  { name: "Edamame", cat: "protein", cal: 122, p: 11, c: 10, f: 5, micro: { iron: 2.3, calcium: 63, zinc: 1 } },
+  { name: "Duck breast", cat: "protein", cal: 201, p: 23, c: 0, f: 11, micro: { selenium: 18, iron: 2.7, zinc: 1.9 } },
+  { name: "Bison (ground)", cat: "protein", cal: 146, p: 22, c: 0, f: 6, micro: { zinc: 5, iron: 2.8, selenium: 15 } },
+  { name: "Scallops", cat: "protein", cal: 88, p: 17, c: 3, f: 0.8, micro: { selenium: 23, zinc: 0.6, calcium: 10 } },
+  { name: "Crab", cat: "protein", cal: 97, p: 19, c: 0, f: 1.5, micro: { selenium: 40, zinc: 4, calcium: 89 } },
+  { name: "Casein protein powder", cat: "protein", cal: 360, p: 78, c: 6, f: 2, micro: { calcium: 700 }, measureByScoop: true }, // ~25g protein per 32g scoop — slow-digesting, common before bed
+  { name: "Pea protein powder", cat: "protein", cal: 380, p: 80, c: 5, f: 6, micro: { iron: 6, zinc: 3 }, measureByScoop: true }, // ~25g protein per 31g scoop — common vegan alternative to whey
+  { name: "Mahi mahi", cat: "protein", cal: 109, p: 24, c: 0, f: 0.9, micro: { selenium: 44 } },
+  { name: "Trout", cat: "protein", cal: 148, p: 21, c: 0, f: 6.6, micro: { vitaminD: 155, selenium: 13 } },
+  { name: "Canadian bacon", cat: "protein", cal: 145, p: 21, c: 1.3, f: 6, micro: { selenium: 25, zinc: 1.5 } },
+  { name: "Chorizo", cat: "protein", cal: 455, p: 24, c: 2, f: 38, micro: { iron: 2.3, zinc: 3.5 } },
+  { name: "Lamb (leg)", cat: "protein", cal: 258, p: 25, c: 0, f: 17, micro: { zinc: 4.5, iron: 1.9, selenium: 25 } },
+  { name: "Anchovies (canned)", cat: "protein", cal: 210, p: 29, c: 0, f: 10, micro: { calcium: 232, selenium: 36 } },
   // Carbs
   { name: "White rice", cat: "carb", cal: 130, p: 2.4, c: 28, f: 0.3, micro: { iron: 1.2 } },
   { name: "Brown rice", cat: "carb", cal: 123, p: 2.7, c: 26, f: 1, micro: { selenium: 10, zinc: 0.6, iron: 0.5 } },
@@ -1094,6 +1120,30 @@ const FOOD_DB = [
   { name: "Berries (mixed)", cat: "carb", cal: 57, p: 0.7, c: 14, f: 0.3, micro: { vitaminC: 30 } },
   { name: "Mango", cat: "carb", cal: 60, p: 0.8, c: 15, f: 0.4, micro: { vitaminC: 36 } },
   { name: "Pineapple", cat: "carb", cal: 50, p: 0.5, c: 13, f: 0.1, micro: { vitaminC: 48 } },
+  { name: "Couscous", cat: "carb", cal: 112, p: 3.8, c: 23, f: 0.2, micro: { selenium: 22, iron: 0.4 } },
+  { name: "Barley", cat: "carb", cal: 123, p: 2.3, c: 28, f: 0.4, micro: { iron: 1.3, zinc: 1 } },
+  { name: "Farro", cat: "carb", cal: 150, p: 5, c: 32, f: 1, micro: { iron: 1.9, zinc: 1.5 } },
+  { name: "Sourdough bread", cat: "carb", cal: 289, p: 11, c: 56, f: 1.9, micro: { iron: 2.4, selenium: 25 } },
+  { name: "English muffin", cat: "carb", cal: 227, p: 8, c: 44, f: 1.8, micro: { iron: 2.8, calcium: 100 } },
+  { name: "Rice cakes", cat: "carb", cal: 387, p: 8, c: 82, f: 2.8, micro: { iron: 1 } },
+  { name: "Plantain", cat: "carb", cal: 122, p: 0.8, c: 32, f: 0.2, micro: { vitaminC: 10 } },
+  { name: "Dates", cat: "carb", cal: 277, p: 1.8, c: 75, f: 0.2, micro: { iron: 0.9, calcium: 39 } },
+  { name: "Raisins", cat: "carb", cal: 299, p: 3.1, c: 79, f: 0.5, micro: { iron: 1.9, calcium: 50 } },
+  { name: "Kiwi", cat: "carb", cal: 61, p: 1.1, c: 15, f: 0.5, micro: { vitaminC: 93 } },
+  { name: "Pear", cat: "carb", cal: 57, p: 0.4, c: 15, f: 0.1, micro: { vitaminC: 4 } },
+  { name: "Cantaloupe", cat: "carb", cal: 34, p: 0.8, c: 8, f: 0.2, micro: { vitaminC: 37 } },
+  { name: "Papaya", cat: "carb", cal: 43, p: 0.5, c: 11, f: 0.3, micro: { vitaminC: 62 } },
+  { name: "Rice noodles", cat: "carb", cal: 109, p: 0.9, c: 25, f: 0.2 },
+  { name: "Soba noodles", cat: "carb", cal: 99, p: 5, c: 21, f: 0.1, micro: { iron: 0.5 } },
+  { name: "Naan", cat: "carb", cal: 310, p: 9, c: 50, f: 8, micro: { calcium: 60, iron: 2.5 } },
+  { name: "Cream of wheat (cooked)", cat: "carb", cal: 60, p: 1.8, c: 13, f: 0.2, micro: { iron: 4 } },
+  { name: "Wild rice", cat: "carb", cal: 101, p: 4, c: 21, f: 0.3, micro: { zinc: 1.3, iron: 0.6 } },
+  { name: "Blueberries", cat: "carb", cal: 57, p: 0.7, c: 14, f: 0.3, micro: { vitaminC: 10 } },
+  { name: "Cherries", cat: "carb", cal: 63, p: 1.1, c: 16, f: 0.2, micro: { vitaminC: 7 } },
+  { name: "Peaches", cat: "carb", cal: 39, p: 0.9, c: 10, f: 0.3, micro: { vitaminC: 6.6 } },
+  { name: "Grapefruit", cat: "carb", cal: 42, p: 0.8, c: 11, f: 0.1, micro: { vitaminC: 31 } },
+  { name: "Figs", cat: "carb", cal: 74, p: 0.8, c: 19, f: 0.3, micro: { calcium: 35, iron: 0.4 } },
+  { name: "Maple syrup", cat: "carb", cal: 260, p: 0, c: 67, f: 0.1, micro: { calcium: 102, zinc: 1.5 } },
   // Fats
   { name: "Peanut butter", cat: "fat", cal: 588, p: 25, c: 20, f: 50, micro: { zinc: 2.7, iron: 1.7 } },
   { name: "Almond butter", cat: "fat", cal: 614, p: 21, c: 19, f: 56, micro: { calcium: 347, iron: 3.5, zinc: 3 } },
@@ -1108,6 +1158,20 @@ const FOOD_DB = [
   { name: "Walnuts", cat: "fat", cal: 654, p: 15, c: 14, f: 65, micro: { zinc: 3.1, iron: 2.9, calcium: 98 } },
   { name: "Cashews", cat: "fat", cal: 553, p: 18, c: 30, f: 44, micro: { zinc: 5.8, iron: 6.7 } },
   { name: "Sunflower seeds", cat: "fat", cal: 584, p: 21, c: 20, f: 51, micro: { selenium: 53, zinc: 5, iron: 5.3 } },
+  { name: "Pistachios", cat: "fat", cal: 560, p: 20, c: 28, f: 45, micro: { calcium: 105, iron: 3.9, zinc: 2.2 } },
+  { name: "Pecans", cat: "fat", cal: 691, p: 9.2, c: 14, f: 72, micro: { zinc: 4.5, iron: 2.5 } },
+  { name: "Macadamia nuts", cat: "fat", cal: 718, p: 7.9, c: 14, f: 76, micro: { iron: 2.7, zinc: 1.3 } },
+  { name: "Chia seeds", cat: "fat", cal: 486, p: 17, c: 42, f: 31, micro: { calcium: 631, iron: 7.7, zinc: 4.6 } },
+  { name: "Flaxseed (ground)", cat: "fat", cal: 534, p: 18, c: 29, f: 42, micro: { calcium: 255, iron: 5.7, zinc: 4.3 } },
+  { name: "Tahini", cat: "fat", cal: 595, p: 17, c: 21, f: 54, micro: { calcium: 426, iron: 9, zinc: 4.6 } },
+  { name: "Pumpkin seeds", cat: "fat", cal: 559, p: 30, c: 11, f: 49, micro: { zinc: 7.8, iron: 8.8, calcium: 46 } },
+  { name: "Brie cheese", cat: "fat", cal: 334, p: 21, c: 0.5, f: 28, micro: { calcium: 184, zinc: 2.4, selenium: 14 } },
+  { name: "Feta cheese", cat: "fat", cal: 264, p: 14, c: 4, f: 21, micro: { calcium: 493, zinc: 2.9, selenium: 15 } },
+  { name: "Ghee", cat: "fat", cal: 900, p: 0, c: 0, f: 100 },
+  { name: "Sunflower seed butter", cat: "fat", cal: 617, p: 19, c: 20, f: 55, micro: { iron: 4.2, zinc: 5, calcium: 78 } },
+  { name: "Coconut milk (canned)", cat: "fat", cal: 230, p: 2.3, c: 6, f: 24, micro: { iron: 1.6 } },
+  { name: "Sesame oil", cat: "fat", cal: 884, p: 0, c: 0, f: 100 },
+  { name: "Brazil nuts", cat: "fat", cal: 659, p: 14, c: 12, f: 66, micro: { selenium: 1917, zinc: 4, calcium: 160 } },
   // Vegetables
   { name: "Broccoli", cat: "veg", cal: 35, p: 2.4, c: 7, f: 0.4, micro: { vitaminC: 89, calcium: 47 } },
   { name: "Green beans", cat: "veg", cal: 35, p: 1.8, c: 7, f: 0.1, micro: { vitaminC: 12, calcium: 37, iron: 1 } },
@@ -1123,6 +1187,18 @@ const FOOD_DB = [
   { name: "Onion", cat: "veg", cal: 40, p: 1.1, c: 9.3, f: 0.1 },
   { name: "Asparagus", cat: "veg", cal: 20, p: 2.2, c: 3.9, f: 0.1, micro: { iron: 2.1 } },
   { name: "Cabbage", cat: "veg", cal: 25, p: 1.3, c: 5.8, f: 0.1, micro: { vitaminC: 37 } },
+  { name: "Brussels sprouts", cat: "veg", cal: 43, p: 3.4, c: 9, f: 0.3, micro: { vitaminC: 85, calcium: 42, iron: 1.4 } },
+  { name: "Eggplant", cat: "veg", cal: 25, p: 1, c: 6, f: 0.2, micro: { vitaminC: 2.2 } },
+  { name: "Celery", cat: "veg", cal: 16, p: 0.7, c: 3, f: 0.2, micro: { vitaminC: 3, calcium: 40 } },
+  { name: "Radish", cat: "veg", cal: 16, p: 0.7, c: 3.4, f: 0.1, micro: { vitaminC: 15 } },
+  { name: "Beets", cat: "veg", cal: 43, p: 1.6, c: 10, f: 0.2, micro: { vitaminC: 4.9, iron: 0.8 } },
+  { name: "Snap peas", cat: "veg", cal: 42, p: 2.8, c: 7.6, f: 0.2, micro: { vitaminC: 60, calcium: 43, iron: 2.1 } },
+  { name: "Artichoke", cat: "veg", cal: 47, p: 3.3, c: 11, f: 0.2, micro: { vitaminC: 12, iron: 1.3 } },
+  { name: "Butternut squash", cat: "veg", cal: 45, p: 1, c: 12, f: 0.1, micro: { vitaminC: 21, calcium: 48 } },
+  { name: "Bok choy", cat: "veg", cal: 13, p: 1.5, c: 2.2, f: 0.2, micro: { vitaminC: 45, calcium: 105 } },
+  { name: "Collard greens", cat: "veg", cal: 32, p: 3, c: 5.4, f: 0.6, micro: { vitaminC: 35, calcium: 232, iron: 0.5 } },
+  { name: "Leeks", cat: "veg", cal: 61, p: 1.5, c: 14, f: 0.3, micro: { vitaminC: 12, calcium: 59, iron: 2.1 } },
+  { name: "Snow peas", cat: "veg", cal: 42, p: 2.8, c: 7.5, f: 0.2, micro: { vitaminC: 60, calcium: 43, iron: 1.5 } },
   // Other (logging only — not used by the Custom Plan solver, which needs the 4 categories above)
   { name: "Milk (2%)", cat: "other", cal: 50, p: 3.3, c: 4.8, f: 2, micro: { calcium: 120, vitaminD: 43 } },
   { name: "Milk (whole)", cat: "other", cal: 61, p: 3.2, c: 4.8, f: 3.3, micro: { calcium: 113, vitaminD: 40 } },
@@ -1140,6 +1216,16 @@ const FOOD_DB = [
   { name: "Ketchup", cat: "other", cal: 101, p: 1.2, c: 26, f: 0.1 },
   { name: "Hummus", cat: "other", cal: 166, p: 8, c: 14, f: 10, micro: { iron: 2.4, zinc: 1.8 } },
   { name: "Salsa", cat: "other", cal: 36, p: 1.6, c: 7.5, f: 0.2 },
+  { name: "Almond milk (unsweetened)", cat: "other", cal: 15, p: 0.6, c: 0.6, f: 1.2, micro: { calcium: 188, vitaminD: 25 } },
+  { name: "Oat milk", cat: "other", cal: 47, p: 1, c: 7.5, f: 1.5, micro: { calcium: 120, vitaminD: 25 } },
+  { name: "Soy milk (unsweetened)", cat: "other", cal: 33, p: 3.3, c: 1.2, f: 1.8, micro: { calcium: 123, vitaminD: 25 } },
+  { name: "Soy sauce", cat: "other", cal: 53, p: 8, c: 4.9, f: 0.1, micro: { iron: 1.5 } },
+  { name: "BBQ sauce", cat: "other", cal: 172, p: 0.8, c: 40, f: 0.5 },
+  { name: "Ranch dressing", cat: "other", cal: 449, p: 1, c: 6, f: 47 },
+  { name: "Balsamic vinaigrette", cat: "other", cal: 260, p: 0.5, c: 12, f: 24 },
+  { name: "Popcorn (air-popped)", cat: "other", cal: 387, p: 13, c: 78, f: 4.5, micro: { iron: 3.2, zinc: 3.4 } },
+  { name: "Trail mix", cat: "other", cal: 462, p: 14, c: 44, f: 29, micro: { iron: 2.6, zinc: 2.5, calcium: 60 } },
+  { name: "Pretzels", cat: "other", cal: 380, p: 10, c: 79, f: 2.6, micro: { iron: 3.1 } },
 ];
 
 
@@ -1312,7 +1398,7 @@ function computeCustomGrocery(override, source) {
 // Solves ONE meal slot against that meal's own liked foods. Shared by generateCustomPlan (solves
 // all 4 at once) and regenerateSingleMeal (solves just one) so both use identical logic — a meal
 // regenerated on its own comes out exactly the same as if the whole plan had been regenerated.
-function generateSingleMealResult(likedFoodsByMeal, source, slot, i) {
+function generateSingleMealResult(likedFoodsByMeal, source, slot, i, avoidNames) {
   const db = source || FOOD_DB;
   const mealKey = "m" + (i + 1);
   const likedNames = (likedFoodsByMeal && likedFoodsByMeal[mealKey]) || [];
@@ -1337,10 +1423,19 @@ function generateSingleMealResult(likedFoodsByMeal, source, slot, i) {
   // Try the "expected" round-robin pick first (keeps meals varied when it already works), then
   // search every other liked combination before giving up. A single infeasible pick shouldn't
   // fail the meal when there are a dozen other liked foods that might solve it just fine —
-  // the old code only ever tried one fixed combination per slot.
+  // the old code only ever tried one fixed combination per slot. Anything already used by an
+  // EARLIER meal in this same generation (avoidNames) is tried LAST rather than forbidden — a
+  // more "flexible" food (e.g. lean chicken breast solving almost any target) would otherwise keep
+  // winning as a fallback across every meal even with rotation, since rotation only changes which
+  // food is tried first, not whether an already-used one can still win by being the only thing that
+  // solves. Repetition is still allowed when nothing else actually works — just de-prioritized.
+  const avoid = avoidNames || [];
   function ordered(list, idx) {
     const first = list[idx % list.length];
-    return [first].concat(list.filter(function (_, k) { return k !== idx % list.length; }));
+    const rotated = [first].concat(list.filter(function (_, k) { return k !== idx % list.length; }));
+    const fresh = rotated.filter(function (f) { return avoid.indexOf(f.name) === -1; });
+    const reused = rotated.filter(function (f) { return avoid.indexOf(f.name) !== -1; });
+    return fresh.concat(reused);
   }
   const proteinOrder = ordered(proteins, i);
   const carbOrder = ordered(carbs, i);
@@ -1409,7 +1504,12 @@ function redistributeAcrossMeals(results, failedIdx, okIdx, slots, likedFoodsByM
 }
 function generateCustomPlan(likedFoodsByMeal, source, slots) {
   const useSlots = slots || SLOTS_CUTTING;
-  let results = useSlots.map(function (slot, i) { return generateSingleMealResult(likedFoodsByMeal, source, slot, i); });
+  const usedSoFar = [];
+  let results = useSlots.map(function (slot, i) {
+    const r = generateSingleMealResult(likedFoodsByMeal, source, slot, i, usedSoFar);
+    if (!r.error) r.items.forEach(function (it) { usedSoFar.push(it.name); });
+    return r;
+  });
   const anyMealHasFoods = results.some(function (r) { return !r.noFoodsPicked; });
   if (!anyMealHasFoods) {
     return { error: "Pick at least one liked food in each of Protein, Carb, and Fat for at least one meal to generate a plan." };
@@ -1420,10 +1520,11 @@ function generateCustomPlan(likedFoodsByMeal, source, slots) {
   return { results: results };
 }
 // Regenerates JUST one meal slot — used when a single meal's liked foods change and the rest of
-// the plan shouldn't be touched.
-function regenerateSingleMeal(likedFoodsByMeal, source, slots, mealIdx) {
+// the plan shouldn't be touched. Accepts the same avoidNames de-prioritization as the full-plan
+// path, so regenerating one meal still prefers not to repeat a food the other 3 meals are using.
+function regenerateSingleMeal(likedFoodsByMeal, source, slots, mealIdx, avoidNames) {
   const useSlots = slots || SLOTS_CUTTING;
-  return generateSingleMealResult(likedFoodsByMeal, source, useSlots[mealIdx], mealIdx);
+  return generateSingleMealResult(likedFoodsByMeal, source, useSlots[mealIdx], mealIdx, avoidNames);
 }
 const DIFFICULTIES = [
   { id: "easy", label: "Easy", cls: "easy" },
@@ -1509,6 +1610,42 @@ function formatTimeHM(t) {
   hh = hh % 12;
   if (hh === 0) hh = 12;
   return hh + ":" + mm + " " + ampm;
+}
+// Converts a raw minutes-from-midnight value (which can be computed as an offset, e.g. "45 min
+// before the first meal") into the same "H:MM AM/PM" display format used everywhere else.
+function minutesToDisplayTime(totalMin) {
+  const wrapped = ((totalMin % 1440) + 1440) % 1440; // wrap safely for offsets that cross midnight
+  const hh24 = Math.floor(wrapped / 60);
+  const mm = wrapped % 60;
+  return formatTimeHM(hh24 + ":" + String(mm).padStart(2, "0"));
+}
+// Builds a hydration checkpoint schedule tied to THIS Custom program's actual meal times and
+// training time, instead of the fixed schedule below (built around one specific real-world
+// routine). One checkpoint 45 min before the first meal ("Wake"), one at each solved meal (the
+// intra-workout drink already covers hydration around training, so it's skipped here to avoid a
+// duplicate), one at Training Time if set, and one 90 min after the day's last checkpoint
+// ("Evening") — all sorted chronologically, sharing the same total daily ounces as the fixed
+// schedule, split evenly across however many checkpoints result.
+function computeCustomHydrationSchedule(meals, trainingTime, fallbackTotal) {
+  const solverMeals = (meals || []).filter(function (m) { return m.id !== "iw" && parseMealTimeToMinutes(m.time) != null; });
+  if (solverMeals.length === 0) return null; // no usable meal times yet — caller falls back to the fixed schedule
+  const checkpoints = [];
+  const firstMealMin = Math.min.apply(null, solverMeals.map(function (m) { return parseMealTimeToMinutes(m.time); }));
+  checkpoints.push({ id: "h_wake", time: minutesToDisplayTime(firstMealMin - 45), label: "Wake", sortMin: ((firstMealMin - 45) % 1440 + 1440) % 1440 });
+  solverMeals.forEach(function (m) {
+    const min = parseMealTimeToMinutes(m.time);
+    checkpoints.push({ id: "h_" + m.id, time: m.time, label: m.name, sortMin: min });
+  });
+  if (trainingTime) {
+    const trainMin = timeToMinutes(trainingTime);
+    if (trainMin != null) checkpoints.push({ id: "h_train", time: formatTimeHM(trainingTime), label: "Training", sortMin: trainMin });
+  }
+  checkpoints.sort(function (a, b) { return a.sortMin - b.sortMin; });
+  const lastMin = checkpoints[checkpoints.length - 1].sortMin;
+  checkpoints.push({ id: "h_evening", time: minutesToDisplayTime(lastMin + 90), label: "Evening", sortMin: (lastMin + 90) % 1440 });
+  const total = fallbackTotal || HYDRATION_TOTAL;
+  const perCheckpoint = Math.round(total / checkpoints.length);
+  return checkpoints.map(function (c) { return { id: c.id, time: c.time, label: c.label, amount: perCheckpoint }; });
 }
 function sleepDurationHours(bedtime, wake) {
   const bed = timeToMinutes(bedtime);
@@ -1770,7 +1907,7 @@ function fireRestNotification(label) {
 }
 
 function App() {
-  const APP_VERSION = "2026-07-19T14:12:48";
+  const APP_VERSION = "2026-07-19T19:30:31";
   const [updateAvailable, setUpdateAvailable] = useState(false);
   useEffect(function () {
     function checkVersion() {
@@ -1938,7 +2075,15 @@ function App() {
   const mealTotals = meals.reduce((a, m) => ({ cal: a.cal + m.cal, p: a.p + m.p, c: a.c + m.c, f: a.f + m.f }), { cal: 0, p: 0, c: 0, f: 0 });
   const groceryOverride = prog.customMealOverrides[groceryDisplayWeek];
   const groceryHasOverride = !!(groceryOverride && Object.keys(groceryOverride).length);
-  const groceryList = groceryHasOverride ? computeCustomGrocery(groceryOverride, allFoods) : def.groceryByWeek[groceryDisplayWeek];
+  // Merge partial per-meal overrides with the week's base meals so the grocery list still reflects
+  // EVERY meal, not just whichever ones were individually applied — a week where only Meal 2 was
+  // swapped shouldn't silently drop Meals 1, 3, and 4 from the shopping list.
+  const groceryFullOverride = {};
+  ["m1", "m2", "m3", "m4"].forEach(function (id) {
+    const baseMeal = def.mealsByWeek[groceryDisplayWeek].filter(function (m) { return m.id === id; })[0];
+    groceryFullOverride[id] = (groceryOverride && groceryOverride[id]) ? groceryOverride[id] : baseMeal;
+  });
+  const groceryList = groceryHasOverride ? computeCustomGrocery(groceryFullOverride, allFoods) : def.groceryByWeek[groceryDisplayWeek];
   const nutritionHasOverride = !!(prog.customMealOverrides[nutritionDisplayWeek] && Object.keys(prog.customMealOverrides[nutritionDisplayWeek]).length);
 
   function logSet(exerciseId, setIdx, reps, weight) {
@@ -2186,7 +2331,14 @@ function App() {
     newLogs[hydrationSelectedDate] = day;
     saveProgram({ hydrationLogs: newLogs });
   }
-  const ozLogged = HYDRATION.filter(function (hy) { return hToday[hy.id]; }).reduce(function (a, hy) { return a + hy.amount; }, 0);
+  // For the Custom program, checkpoints are derived from this person's own meal times/training
+  // time instead of the fixed schedule below (which was built around one specific real-world
+  // routine and doesn't generalize). Built-in programs keep the fixed schedule, since their meal
+  // times are already fixed too.
+  const customHydrationSchedule = data.activeProgram === "custom" ? computeCustomHydrationSchedule(meals, def.trainingTime, HYDRATION_TOTAL) : null;
+  const activeHydration = customHydrationSchedule || HYDRATION;
+  const activeHydrationTotal = customHydrationSchedule ? customHydrationSchedule.reduce(function (a, hy) { return a + hy.amount; }, 0) : HYDRATION_TOTAL;
+  const ozLogged = activeHydration.filter(function (hy) { return hToday[hy.id]; }).reduce(function (a, hy) { return a + hy.amount; }, 0);
   function completeHydrationDay() {
     const newDone = Object.assign({}, prog.hydrationDayComplete || {});
     newDone[hydrationSelectedDate] = true;
@@ -2198,9 +2350,9 @@ function App() {
     const key = dateKeyDaysAgo(i);
     const dayLog = prog.hydrationLogs[key];
     if (dayLog && Object.keys(dayLog).length > 0) {
-      const checkedCount = HYDRATION.filter(function (hy) { return dayLog[hy.id]; }).length;
-      const ozThatDay = HYDRATION.filter(function (hy) { return dayLog[hy.id]; }).reduce(function (a, hy) { return a + hy.amount; }, 0);
-      hydrationHistory.push({ date: key, checkedCount: checkedCount, oz: ozThatDay, hitGoal: ozThatDay >= HYDRATION_TOTAL, complete: !!(prog.hydrationDayComplete || {})[key] });
+      const checkedCount = activeHydration.filter(function (hy) { return dayLog[hy.id]; }).length;
+      const ozThatDay = activeHydration.filter(function (hy) { return dayLog[hy.id]; }).reduce(function (a, hy) { return a + hy.amount; }, 0);
+      hydrationHistory.push({ date: key, checkedCount: checkedCount, oz: ozThatDay, hitGoal: ozThatDay >= activeHydrationTotal, complete: !!(prog.hydrationDayComplete || {})[key] });
     }
   }
 
@@ -2305,6 +2457,31 @@ function App() {
   }
   const adaptiveTDEE = computeAdaptiveTDEE();
   const plannedCalories = (data.customProgramConfig && data.customProgramConfig.macros) ? data.customProgramConfig.macros.cal : null;
+  // Closes the adaptive-TDEE loop: instead of just flagging that the implied TDEE has diverged from
+  // the plan and asking the person to manually redo setup, this recalculates the target directly —
+  // same goal-adjustment and diet-style split logic as the original wizard math (macrosFromMaintenance),
+  // just fed the empirically-measured maintenance number instead of the Mifflin-St Jeor estimate.
+  // Uses the most recently logged daily weight (not the original setup-time weight) for the protein
+  // target, since that's the actual current bodyweight the adaptive estimate is already built from.
+  // Only updates the TARGET macros/slots — it deliberately does not re-solve or touch the already-
+  // generated meals, since that's a separate, explicit action (regenerate in the Food Plan tab).
+  function updateMacrosFromAdaptiveTDEE() {
+    const config = data.customProgramConfig;
+    if (!config || !adaptiveTDEE || adaptiveTDEE.insufficientData) return;
+    const weightKeys = Object.keys(prog.dailyWeightLogs).sort();
+    const latestWeight = weightKeys.length > 0 ? prog.dailyWeightLogs[weightKeys[weightKeys.length - 1]] : config.currentWeight;
+    const newMacros = macrosFromMaintenance(adaptiveTDEE.impliedTDEE, latestWeight, config.goal, config.dietStyle || "standard");
+    const intraWorkoutMacros = config.intraWorkout || null;
+    const remaining = intraWorkoutMacros
+      ? { p: newMacros.p - intraWorkoutMacros.p, c: newMacros.c - intraWorkoutMacros.c, f: newMacros.f - intraWorkoutMacros.f }
+      : { p: newMacros.p, c: newMacros.c, f: newMacros.f };
+    const perMeal = { p: remaining.p / 4, c: remaining.c / 4, f: remaining.f / 4 };
+    const newSlots = config.slots.map(function (slot) {
+      return Object.assign({}, slot, { p: Math.round(perMeal.p), c: Math.round(perMeal.c), f: Math.round(perMeal.f) });
+    });
+    save(Object.assign({}, data, { customProgramConfig: Object.assign({}, config, { macros: newMacros, slots: newSlots, currentWeight: latestWeight }) }));
+    showToast("Target updated to " + newMacros.cal + " cal — regenerate your meals in the Food Plan tab to match.");
+  }
 
   const groceryKey = "w" + groceryDisplayWeek;
   const groceryChecked = (prog.groceryLogs && prog.groceryLogs[groceryKey]) || {};
@@ -2434,6 +2611,8 @@ function App() {
       activity: setup.activity, weeksNeeded: setup.weeksNeeded, macros: setup.macros, age: setup.age,
       exercises: setup.exercises, slots: setup.slots, milestones: setup.milestones,
       mealsByWeek: mealsByWeek, groceryByWeek: groceryByWeek, trainingTime: setup.trainingTime || null,
+      dietStyle: setup.dietStyle || "standard", gender: setup.gender || null, heightCm: setup.heightCm || null,
+      intraWorkout: setup.intraWorkout || null,
     };
     const newPrograms = Object.assign({}, data.programs, { custom: freshProgramState(setup.exercises) });
     save(Object.assign({}, data, { customProgramConfig: config, programs: newPrograms, activeProgram: "custom" }));
@@ -2606,6 +2785,7 @@ function App() {
               hasOverride: nutritionHasOverride,
               foodLog: todaysFoodLog, logFood: logFood, removeFoodLogEntry: removeFoodLogEntry, updateFoodLogGrams: updateFoodLogGrams,
               allFoods: allFoods, completeNutritionDay: completeNutritionDay, nutritionHistory: nutritionHistory,
+              addCustomFood: addCustomFood,
               dayComplete: !!(prog.nutritionDayComplete || {})[nutritionSelectedDate],
               weekOffset: nutritionWeekOffset, setWeekOffset: setNutritionWeekOffset,
               dayIdx: nutritionDayIdx, setDayIdx: setNutritionDayIdx,
@@ -2619,6 +2799,7 @@ function App() {
             }),
             tab === "hydration" && h(HydrationTab, {
               hToday: hToday, toggleHydration: toggleHydration, ozLogged: ozLogged, hydrationHistory: hydrationHistory,
+              hydrationSchedule: activeHydration, hydrationTotal: activeHydrationTotal,
               sleepToday: sleepToday, updateSleep: updateSleep, sleepHistory: sleepHistory,
               weekOffset: hydrationWeekOffset, setWeekOffset: setHydrationWeekOffset,
               dayIdx: hydrationDayIdx, setDayIdx: setHydrationDayIdx,
@@ -2631,6 +2812,7 @@ function App() {
               hasTargets: def.hasMilestoneTargets, goalLine: def.goalLine, customMilestones: def.customMilestones || null,
               dailyWeightLogs: prog.dailyWeightLogs, logDailyWeight: logDailyWeight,
               adaptiveTDEE: adaptiveTDEE, plannedCalories: plannedCalories,
+              isCustomProgram: data.activeProgram === "custom", updateMacrosFromAdaptiveTDEE: updateMacrosFromAdaptiveTDEE,
             }),
             tab === "grocery" && h(GroceryTab, {
               list: groceryList, checked: groceryChecked, toggle: toggleGrocery, reset: resetGroceryList,
@@ -3110,9 +3292,19 @@ function AdaptiveTDEESection(props) {
           h("div", { className: "sleep-duration-row" }, h("span", null, "Real weekly trend"), h("span", null, (tdee.weeklyRateLb > 0 ? "+" : "") + tdee.weeklyRateLb + " lb/week")),
           h("div", { className: "sleep-duration-row" }, h("span", null, "Avg. calories actually logged"), h("span", null, tdee.avgCalories + " cal/day")),
           h("div", { className: "sleep-duration-row" }, h("span", null, "Implied true TDEE"), h("span", null, tdee.impliedTDEE + " cal/day")),
-          diverging && h("p", { className: "plan-error", style: { marginTop: 8 } },
-            "Your implied TDEE (" + tdee.impliedTDEE + ") differs from your planned calories (" + props.plannedCalories + ") by " +
-            Math.abs(tdee.impliedTDEE - props.plannedCalories) + " cal/day — worth recalculating your target through the Custom setup again."),
+          diverging && h("div", { className: "plan-error", style: { marginTop: 8 } },
+            h("p", { style: { margin: props.isCustomProgram ? "0 0 8px" : 0 } },
+              "Your implied TDEE (" + tdee.impliedTDEE + ") differs from your planned calories (" + props.plannedCalories + ") by " +
+              Math.abs(tdee.impliedTDEE - props.plannedCalories) + " cal/day" +
+              (props.isCustomProgram ? "." : " — worth recalculating your target through the Custom setup again.")),
+            props.isCustomProgram && h("button", {
+              className: "swap-save-btn", style: { width: "100%" },
+              onClick: function () {
+                if (window.confirm("Update your target to " + tdee.impliedTDEE + " cal/day (adjusted for your cut/bulk/maintain goal)? You'll still need to regenerate your meals in the Food Plan tab to match the new numbers.")) {
+                  props.updateMacrosFromAdaptiveTDEE();
+                }
+              },
+            }, "Update My Target")),
           h("p", { style: { fontSize: "11px", color: "#525252", marginTop: 8 } },
             "Uses a single fixed energy-density assumption (3,500 cal/lb) rather than one that adjusts for how fast you're changing — a real simplification, not a precise composition measurement.")
         )
@@ -3303,6 +3495,17 @@ function lookupBarcode(barcode) {
     .catch(function () { return { error: "Couldn't reach the food database — check your connection and try again." }; });
 }
 
+// A rough heuristic for auto-categorizing a barcode-scanned food when logging it (the daily-logging
+// flow doesn't ask for a category the way the Food Plan tab's "add a food" flow does) — whichever
+// macro contributes the most calories decides protein/carb/fat. Imperfect for mixed foods, but a
+// reasonable default; a wrongly-bucketed item can be removed and re-added with the right category
+// via the Food Plan tab if it matters for meal planning.
+function guessFoodCategory(per100) {
+  const pCal = (per100.p || 0) * 4, cCal = (per100.c || 0) * 4, fCal = (per100.f || 0) * 9;
+  if (pCal >= cCal && pCal >= fCal) return "protein";
+  if (fCal >= cCal && fCal >= pCal) return "fat";
+  return "carb";
+}
 function BarcodeLogger(props) {
   const [mode, setMode] = useState("idle"); // idle | scanning | loading | found | error | manual
   const [manualCode, setManualCode] = useState("");
@@ -3411,7 +3614,16 @@ function BarcodeLogger(props) {
       h("div", { style: { display: "flex", gap: 8, marginTop: 8 } },
         h("button", {
           className: "swap-save-btn", style: { flex: 1 },
-          onClick: function () { props.logFood(product.name, grams, product.per100); setMode("idle"); setProduct(null); },
+          onClick: function () {
+            props.logFood(product.name, grams, product.per100);
+            // Also save it into the reusable food list — otherwise a food scanned here is invisible
+            // when picking liked foods for meal planning later, and would need to be re-scanned there.
+            const alreadyKnown = (props.allFoods || []).some(function (f) { return f.name === product.name; });
+            if (props.addCustomFood && !alreadyKnown) {
+              props.addCustomFood(product.name, guessFoodCategory(product.per100), product.per100);
+            }
+            setMode("idle"); setProduct(null);
+          },
         }, "Log It"),
         h("button", { className: "ex-action-btn", onClick: cancel }, "Cancel")
       )
@@ -3920,7 +4132,7 @@ function NutritionTab(props) {
         });
       })
     ),
-    h(FoodSearchLog, { foodLog: props.foodLog, logFood: props.logFood, removeEntry: props.removeFoodLogEntry, updateGrams: props.updateFoodLogGrams, allFoods: props.allFoods }),
+    h(FoodSearchLog, { foodLog: props.foodLog, logFood: props.logFood, removeEntry: props.removeFoodLogEntry, updateGrams: props.updateFoodLogGrams, allFoods: props.allFoods, addCustomFood: props.addCustomFood }),
     !isFutureDay && h("button", { className: "complete-btn", style: { marginBottom: 16 }, onClick: props.completeNutritionDay },
       props.dayComplete ? "✓ Logged — Update" : "Complete This Day"),
     h(SupplementManager, { supplementList: props.supplementList, addSupplement: props.addSupplement, removeSupplement: props.removeSupplement, uiPrefs: props.uiPrefs, updateUiPrefs: props.updateUiPrefs }),
@@ -3957,7 +4169,7 @@ function FoodSearchLog(props) {
     : [];
   return h("div", { style: { marginBottom: 24 } },
     h("div", { className: "food-cat-title" }, "Log Anything Else"),
-    h(BarcodeLogger, { logFood: props.logFood }),
+    h(BarcodeLogger, { logFood: props.logFood, addCustomFood: props.addCustomFood, allFoods: props.allFoods }),
     h("input", {
       type: "text", value: query, onChange: function (e) { setQuery(e.target.value); },
       placeholder: "Or search foods (e.g. \"banana\", \"pizza\", \"rice\")",
@@ -4007,7 +4219,9 @@ function MacroBar(props) {
 }
 
 function HydrationTab(props) {
-  const pct = Math.min(100, Math.round((props.ozLogged / HYDRATION_TOTAL) * 100));
+  const schedule = props.hydrationSchedule || HYDRATION;
+  const scheduleTotal = props.hydrationTotal || HYDRATION_TOTAL;
+  const pct = Math.min(100, Math.round((props.ozLogged / scheduleTotal) * 100));
   const DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
   const todayIdx = todayDayIdx();
   const isFutureDay = props.weekOffset === 0 && props.dayIdx > todayIdx;
@@ -4051,11 +4265,11 @@ function HydrationTab(props) {
     isFutureDay && h("div", { className: "preview-banner" }, "That's a future day — nothing to log yet."),
 
     h("div", { className: "panel hydration-summary" },
-      h("div", { className: "row" }, h("span", null, dateLabel + "'s fluid intake"), h("span", null, props.ozLogged + " / " + HYDRATION_TOTAL + " oz")),
+      h("div", { className: "row" }, h("span", null, dateLabel + "'s fluid intake"), h("span", null, props.ozLogged + " / " + scheduleTotal + " oz")),
       h("div", { className: "bar-track hydration-track" }, h("div", { className: "bar-fill sky", style: { width: pct + "%" } }))
     ),
     h("div", null,
-      HYDRATION.map(function (hy) {
+      schedule.map(function (hy) {
         const done = !!props.hToday[hy.id];
         return h("button", {
           key: hy.id, disabled: isFutureDay, onClick: function () { props.toggleHydration(hy.id); },
@@ -4087,7 +4301,7 @@ function HydrationTab(props) {
             onClick: function () { jumpToDate(entry.date); },
           },
             h("span", { className: "history-week" }, entry.date + (entry.hitGoal ? " ✓" : "")),
-            h("span", { className: "history-sets" }, entry.checkedCount + "/" + HYDRATION.length + " checkpoints · " + entry.oz + "oz / " + HYDRATION_TOTAL + "oz")
+            h("span", { className: "history-sets" }, entry.checkedCount + "/" + schedule.length + " checkpoints · " + entry.oz + "oz / " + scheduleTotal + "oz")
           );
         })
       )
@@ -4198,7 +4412,7 @@ function MilestonesTab(props) {
         })
       ),
       h(BodyCompositionChart, { actuals: props.actuals }),
-      h(AdaptiveTDEESection, { dailyWeightLogs: props.dailyWeightLogs, logDailyWeight: props.logDailyWeight, adaptiveTDEE: props.adaptiveTDEE, plannedCalories: props.plannedCalories })
+      h(AdaptiveTDEESection, { dailyWeightLogs: props.dailyWeightLogs, logDailyWeight: props.logDailyWeight, adaptiveTDEE: props.adaptiveTDEE, plannedCalories: props.plannedCalories, isCustomProgram: props.isCustomProgram, updateMacrosFromAdaptiveTDEE: props.updateMacrosFromAdaptiveTDEE })
     );
   }
   const baseMilestones = props.customMilestones || MILESTONES;
@@ -4249,7 +4463,7 @@ function MilestonesTab(props) {
       })
     ),
     h(BodyCompositionChart, { actuals: props.actuals }),
-    h(AdaptiveTDEESection, { dailyWeightLogs: props.dailyWeightLogs, logDailyWeight: props.logDailyWeight, adaptiveTDEE: props.adaptiveTDEE, plannedCalories: props.plannedCalories })
+    h(AdaptiveTDEESection, { dailyWeightLogs: props.dailyWeightLogs, logDailyWeight: props.logDailyWeight, adaptiveTDEE: props.adaptiveTDEE, plannedCalories: props.plannedCalories, isCustomProgram: props.isCustomProgram, updateMacrosFromAdaptiveTDEE: props.updateMacrosFromAdaptiveTDEE })
   );
 }
 
@@ -4418,6 +4632,7 @@ function CustomSetupWizard(props) {
       activity: activity, weeksNeeded: computed.weeksNeeded, macros: computed.macros, age: computed.age,
       exercises: computed.exercises, slots: computed.slots, milestones: computed.milestones,
       planResults: plan.results, trainingTime: trainingTime || null, intraWorkout: computed.intraWorkout || null,
+      dietStyle: dietStyle, gender: gender, heightCm: computed.heightCm,
     });
   }
 
@@ -4669,8 +4884,12 @@ function CustomPlanTab(props) {
   // valid result, proportional to their own size, and those get re-solved once at the bumped target
   // — a one-time fallback, not an ongoing dependency between meals.
   function regenerateMeal(mealIdx) {
-    const result = regenerateSingleMeal(props.likedFoods, props.allFoods, props.slots, mealIdx);
     const priorResults = (plan && plan.results) || props.slots.map(function () { return null; });
+    const avoidNames = [];
+    priorResults.forEach(function (r, i) {
+      if (i !== mealIdx && r && !r.error) r.items.forEach(function (it) { avoidNames.push(it.name); });
+    });
+    const result = regenerateSingleMeal(props.likedFoods, props.allFoods, props.slots, mealIdx, avoidNames);
     let newResults = priorResults.slice();
     newResults[mealIdx] = result;
     if (result.error) {
