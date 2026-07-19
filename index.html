@@ -1678,7 +1678,7 @@ function makeDefaultData() {
     customProgramConfig: null,
     supplementList: [],
     restTimerSettings: { enabled: false, seconds: 90 }, // client-side post-set rest reminder — no backend involved
-    uiPrefs: { sleepExpanded: true, supplementsBoxExpanded: true, yourSupplementsOpen: false, unscheduledSupplementsOpen: false, foodPlanExpandedMeals: { m1: false, m2: false, m3: false, m4: false } }, // manual collapse/expand toggles — persisted so they stay as left across tab switches
+    uiPrefs: { sleepExpanded: false, supplementsBoxExpanded: false, yourSupplementsOpen: false, unscheduledSupplementsOpen: false, foodPlanExpandedMeals: { m1: false, m2: false, m3: false, m4: false } }, // manual collapse/expand toggles — persisted so they stay as left across tab switches
     programs: {
       cutting: freshProgramState(EXERCISES_CUTTING),
       cruise: freshProgramState(EXERCISES_CRUISE),
@@ -1715,7 +1715,7 @@ function normalizeV2(parsed) {
     customProgramConfig: parsed.customProgramConfig || null,
     supplementList: parsed.supplementList || [],
     restTimerSettings: Object.assign({ enabled: false, seconds: 90 }, parsed.restTimerSettings || {}),
-    uiPrefs: Object.assign({ sleepExpanded: true, supplementsBoxExpanded: true, yourSupplementsOpen: false, unscheduledSupplementsOpen: false, foodPlanExpandedMeals: { m1: false, m2: false, m3: false, m4: false } }, parsed.uiPrefs || {}),
+    uiPrefs: Object.assign({ sleepExpanded: false, supplementsBoxExpanded: false, yourSupplementsOpen: false, unscheduledSupplementsOpen: false, foodPlanExpandedMeals: { m1: false, m2: false, m3: false, m4: false } }, parsed.uiPrefs || {}),
     programs: {
       cutting: mergeProgramState(withLegacySupplementLogs((parsed.programs || {}).cutting), EXERCISES_CUTTING),
       cruise: mergeProgramState(withLegacySupplementLogs((parsed.programs || {}).cruise), EXERCISES_CRUISE),
@@ -1770,7 +1770,7 @@ function fireRestNotification(label) {
 }
 
 function App() {
-  const APP_VERSION = "2026-07-19T13:40:20";
+  const APP_VERSION = "2026-07-19T14:12:48";
   const [updateAvailable, setUpdateAvailable] = useState(false);
   useEffect(function () {
     function checkVersion() {
@@ -2611,6 +2611,7 @@ function App() {
               dayIdx: nutritionDayIdx, setDayIdx: setNutritionDayIdx,
               selectedDate: nutritionSelectedDate, isToday: nutritionIsToday,
               isCustomProgram: data.activeProgram === "custom", swapIngredient: swapMealIngredient, likedFoods: data.likedFoodsByMeal,
+              goToFoodPlan: function () { setTab("custom"); },
               supplementList: data.supplementList, supplementLogsToday: prog.supplementLogs[nutritionSelectedDate] || {},
               addSupplement: addSupplement, removeSupplement: removeSupplement, toggleSupplementLog: toggleSupplementLog,
               nutrientWarnings: checkCombinedNutrientOverlaps(data.supplementList, prog.foodLog[nutritionSelectedDate] || [], allFoods),
@@ -2899,7 +2900,7 @@ function WorkoutsTab(props) {
     day.cardio && props.targetHR && h("div", { className: "plan-error", style: { marginBottom: 12, border: "2px solid #4eba6f" } },
       h("strong", null, "Target heart rate for fat-burning: ~" + props.targetHR + " bpm")
     ),
-    !isRest && h("div", { style: { display: "flex", gap: 8, marginBottom: 12 } },
+    day.exercises.length > 0 && h("div", { style: { display: "flex", gap: 8, marginBottom: 12 } },
       !groupingMode
         ? h("button", { className: "ex-action-btn", onClick: function () { setGroupingMode(true); setPendingSelection([]); } }, "Create Superset")
         : h(React.Fragment, null,
@@ -3562,8 +3563,14 @@ function MealSwapControl(props) {
       h("option", { value: "" }, "Choose a " + openRole + "..."),
       catFoods.map(function (f) { return h("option", { key: f.name, value: f.name }, f.name); })
     ),
-    openRole && catFoods.length === 0 && h("p", { style: { fontSize: "11px", color: "#737373", marginTop: 4 } },
-      "No liked " + openRole + "s to swap in yet — add some in the Food Plan tab first.")
+    openRole && catFoods.length === 0 && h("div", { style: { marginTop: 4 } },
+      h("p", { style: { fontSize: "11px", color: "#737373", margin: "0 0 4px" } },
+        "No liked " + openRole + "s to swap in yet for this meal."),
+      h("button", {
+        className: "ex-action-btn",
+        onClick: function () { if (props.goToFoodPlan) props.goToFoodPlan(); },
+      }, "Go like some " + openRole + "s in the Food Plan tab")
+    )
   );
 }
 
@@ -3900,6 +3907,7 @@ function NutritionTab(props) {
           ? h(MealSwapControl, {
               allFoods: props.allFoods, likedFoods: (props.likedFoods && props.likedFoods[m.id]) || [],
               onSwap: function (role, foodName) { props.swapIngredient(idx, role, foodName); },
+              goToFoodPlan: props.goToFoodPlan,
             })
           : null;
         return h(MealCard, {
@@ -4566,7 +4574,7 @@ function CustomSetupWizard(props) {
       computed.slots.map(function (slot, idx) {
         const mealKey = "m" + (idx + 1);
         const likedForMeal = likedFoodsByMealCustom[mealKey] || [];
-        const isOpen = likedForMeal.length === 0 || !!expandedMeals[mealKey];
+        const isOpen = !!expandedMeals[mealKey];
         return h("div", { key: mealKey, style: { marginBottom: 20, paddingBottom: 16, borderBottom: "1px solid #262626" } },
           h("button", {
             onClick: function () { setExpandedMeals(Object.assign({}, expandedMeals, { [mealKey]: !isOpen })); },
@@ -4692,7 +4700,7 @@ function CustomPlanTab(props) {
       const mealKey = "m" + (idx + 1);
       const likedForMeal = (props.likedFoods && props.likedFoods[mealKey]) || [];
       const expandedMeals = (props.uiPrefs && props.uiPrefs.foodPlanExpandedMeals) || { m1: false, m2: false, m3: false, m4: false };
-      const isOpen = likedForMeal.length === 0 || !!expandedMeals[mealKey];
+      const isOpen = !!expandedMeals[mealKey];
       const r = plan && plan.results ? plan.results[idx] : null;
       return h("div", { key: mealKey, style: { marginBottom: 20, paddingBottom: 16, borderBottom: "1px solid #262626" } },
         h("button", {
