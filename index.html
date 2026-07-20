@@ -1914,7 +1914,7 @@ function fireRestNotification(label) {
 }
 
 function App() {
-  const APP_VERSION = "2026-07-20T02:31:08";
+  const APP_VERSION = "2026-07-20T04:24:53";
   const [updateAvailable, setUpdateAvailable] = useState(false);
   useEffect(function () {
     function checkVersion() {
@@ -3730,7 +3730,12 @@ function WeekSelector(props) {
 // foods list, since that's the pool the underlying solver draws from to recompute exact grams.
 function MealSwapControl(props) {
   const [openRole, setOpenRole] = useState(null);
-  const catFoods = openRole ? props.allFoods.filter(function (f) { return f.cat === openRole && props.likedFoods.indexOf(f.name) !== -1; }) : [];
+  // Liked foods stay quick to reach at the top, but the rest of the database is right there too —
+  // picking anything, liked or not, swaps immediately. No more needing to go "like" a food first in
+  // a separate step before it's even selectable here.
+  const allInCat = openRole ? props.allFoods.filter(function (f) { return f.cat === openRole; }) : [];
+  const likedInCat = allInCat.filter(function (f) { return props.likedFoods.indexOf(f.name) !== -1; });
+  const otherInCat = allInCat.filter(function (f) { return props.likedFoods.indexOf(f.name) === -1; });
   return h("div", { style: { marginTop: 10 } },
     h("div", { style: { display: "flex", gap: 6 } },
       ["protein", "carb", "fat"].map(function (role) {
@@ -3742,18 +3747,20 @@ function MealSwapControl(props) {
     ),
     openRole && h("select", {
       className: "search-input", style: { marginTop: 6 }, value: "",
-      onChange: function (e) { if (e.target.value) { props.onSwap(openRole, e.target.value); setOpenRole(null); } },
+      onChange: function (e) {
+        if (!e.target.value) return;
+        props.onSwap(openRole, e.target.value);
+        if (props.likedFoods.indexOf(e.target.value) === -1) props.onAutoLike(e.target.value);
+        setOpenRole(null);
+      },
     },
       h("option", { value: "" }, "Choose a " + openRole + "..."),
-      catFoods.map(function (f) { return h("option", { key: f.name, value: f.name }, f.name); })
-    ),
-    openRole && catFoods.length === 0 && h("div", { style: { marginTop: 4 } },
-      h("p", { style: { fontSize: "11px", color: "#737373", margin: "0 0 4px" } },
-        "No liked " + openRole + "s to swap in yet for this meal."),
-      h("button", {
-        className: "ex-action-btn",
-        onClick: function () { if (props.onOpenCustomize) props.onOpenCustomize(); },
-      }, "Go like some " + openRole + "s below")
+      likedInCat.length > 0 && h("optgroup", { label: "Liked" },
+        likedInCat.map(function (f) { return h("option", { key: f.name, value: f.name }, f.name); })
+      ),
+      otherInCat.length > 0 && h("optgroup", { label: "All " + openRole + "s" },
+        otherInCat.map(function (f) { return h("option", { key: f.name, value: f.name }, f.name); })
+      )
     )
   );
 }
@@ -4185,14 +4192,11 @@ function NutritionTab(props) {
         const entry = props.nToday[m.id];
         const status = entry ? (entry.status === "partial" ? (entry.pct === 75 ? "three_quarter" : "half") : entry.status) : null;
         const expandedMeals = (props.uiPrefs && props.uiPrefs.foodPlanExpandedMeals) || { m1: false, m2: false, m3: false, m4: false };
-        const openCustomizeForThisMeal = function () {
-          props.updateUiPrefs({ foodPlanExpandedMeals: Object.assign({}, expandedMeals, { [m.id]: true }) });
-        };
         const mealSwapControl = props.isCustomProgram && !isFutureWeek && !isFutureDay && m.id !== "iw"
           ? h(MealSwapControl, {
               allFoods: props.allFoods, likedFoods: (props.likedFoods && props.likedFoods[m.id]) || [],
               onSwap: function (role, foodName) { props.swapIngredient(idx, role, foodName); },
-              onOpenCustomize: openCustomizeForThisMeal,
+              onAutoLike: function (foodName) { props.toggleLiked(m.id, foodName); },
             })
           : null;
         const showCustomize = props.isCustomProgram && !isFutureWeek && !isFutureDay && m.id !== "iw";
