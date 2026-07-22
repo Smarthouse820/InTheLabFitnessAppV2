@@ -1761,17 +1761,26 @@ function computePhaseWeeks(upToWeek, extraDeloadWeeks) {
   return weeks;
 }
 // Scores one exercise's performance across a completed phase: how many weeks it was actually
-// trained, how many of those hit/exceeded the rep range's ceiling (a real progression event), and
-// how many were rated easy or just right (never "hard").
-function scoreExerciseInPhase(exerciseId, phaseWeeks, logsByWeek, difficultyByWeek, skippedByWeek, range) {
+// trained, how many of those counted as "progressed," and how many were rated easy or just right
+// (never "hard"). Progression normally means hitting/exceeding the fixed rep range's ceiling; when
+// rirMissHistory is provided (RIR mode is active for this exercise), it reuses that exact same
+// miss-tracking already computed and stored by the weekly RIR update instead — a fixed rep ceiling
+// isn't a meaningful concept for an exercise whose target itself moves every week.
+function scoreExerciseInPhase(exerciseId, phaseWeeks, logsByWeek, difficultyByWeek, skippedByWeek, range, rirMissHistory) {
   let trainedWeeks = 0, progressedWeeks = 0, easyRightWeeks = 0;
   phaseWeeks.forEach(function (w) {
     if ((skippedByWeek[w] || {})[exerciseId]) return;
     const setsLogged = ((logsByWeek[w] || {})[exerciseId] || []).filter(Boolean);
     if (setsLogged.length === 0) return;
     trainedWeeks++;
-    const maxReps = Math.max.apply(null, setsLogged.map(function (s) { return s.reps || 0; }));
-    if (maxReps >= range.repHigh) progressedWeeks++;
+    if (rirMissHistory) {
+      // Aligned by trained-week order — rirMissHistory only ever appends for weeks that were
+      // actually trained, in the same order phaseWeeks is walked here.
+      if (rirMissHistory[trainedWeeks - 1] === false) progressedWeeks++;
+    } else {
+      const maxReps = Math.max.apply(null, setsLogged.map(function (s) { return s.reps || 0; }));
+      if (maxReps >= range.repHigh) progressedWeeks++;
+    }
     const rating = (difficultyByWeek[w] || {})[exerciseId];
     if (rating === "easy" || rating === "right") easyRightWeeks++;
   });
@@ -1875,7 +1884,7 @@ const VOLUME_CEILING_PER_MUSCLE = 20; // weekly sets per muscle group — sits a
 // "consistently met," and adding a set wouldn't push the group's weekly total past the ceiling).
 // The exercise chosen to receive the added set is whichever qualifying exercise showed the
 // strongest signal — most weeks progressed, ties broken by most weeks rated easy/just-right.
-function evaluateVolumeIncrease(allExercisesFlat, phaseWeeks, logsByWeek, difficultyByWeek, skippedByWeek, exerciseStateSource) {
+function evaluateVolumeIncrease(allExercisesFlat, phaseWeeks, logsByWeek, difficultyByWeek, skippedByWeek, exerciseStateSource, rirModeEnabled) {
   const byMuscle = {};
   allExercisesFlat.forEach(function (ex) {
     const state = exerciseStateSource[ex.id] || {};
@@ -1891,7 +1900,7 @@ function evaluateVolumeIncrease(allExercisesFlat, phaseWeeks, logsByWeek, diffic
     exercises.forEach(function (ex) {
       const state = exerciseStateSource[ex.id] || {};
       const range = effectiveRepRange(ex, state);
-      scores[ex.id] = scoreExerciseInPhase(ex.id, phaseWeeks, logsByWeek, difficultyByWeek, skippedByWeek, range);
+      scores[ex.id] = scoreExerciseInPhase(ex.id, phaseWeeks, logsByWeek, difficultyByWeek, skippedByWeek, range, rirModeEnabled ? (state.rirMissHistory || []) : null);
     });
     const qualifying = exercises.filter(function (ex) { return exerciseConsistentlyMet(scores[ex.id]); });
     if (qualifying.length === 0 || qualifying.length / exercises.length <= 0.5) return;
@@ -2174,7 +2183,7 @@ function fireRestNotification(label) {
 }
 
 function App() {
-  const APP_VERSION = "2026-07-22T07:08:34";
+  const APP_VERSION = "2026-07-22T07:12:16";
   const [updateAvailable, setUpdateAvailable] = useState(false);
   useEffect(function () {
     function checkVersion() {
@@ -2504,7 +2513,7 @@ function App() {
     // both are phase-boundary judgments. Requires an explicit accept, same as every other
     // consequential suggestion in this app; never applied silently.
     const volumeIncreaseRecommendations = nextWeekAlreadyDeload
-      ? evaluateVolumeIncrease(allExercises(def.exercises), computePhaseWeeks(week, prog.extraDeloadWeeks), Object.assign({}, prog.logs, { [week]: weekLogs }), prog.exerciseDifficulty, prog.skipped, newState)
+      ? evaluateVolumeIncrease(allExercises(def.exercises), computePhaseWeeks(week, prog.extraDeloadWeeks), Object.assign({}, prog.logs, { [week]: weekLogs }), prog.exerciseDifficulty, prog.skipped, newState, rirModeEnabled)
       : [];
     const ratings = Object.keys(weekDifficulty).map(function (id) { return weekDifficulty[id]; });
     const totalRated = ratings.length;
