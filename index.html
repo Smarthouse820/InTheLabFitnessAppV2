@@ -12,6 +12,7 @@
 <link rel="manifest" href="manifest.json">
 <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
 <style>
   * { box-sizing: border-box; }
   body { margin: 0; -webkit-tap-highlight-color: transparent; overscroll-behavior: none; overflow-x: hidden;
@@ -2342,8 +2343,40 @@ function buildPushSchedule(data) {
   return daily.concat(extra);
 }
 
+// ---- Supabase (accounts + cloud backup) ----
+// Ported from the personal file, where every piece below was proven working before it came here:
+// login/signup, manual backup, debounced automatic backup, offline skip-and-retry, manual restore,
+// and the fresh-device restore prompt. Row-Level Security was adversarially tested with two
+// accounts (read, write, upsert, and delete attempts across accounts, all refused) before this
+// file was allowed to touch it.
+//
+// The URL and anon/public key are both meant to be public — same treatment as VAPID_PUBLIC_KEY and
+// WITHINGS_CLIENT_ID. RLS is what keeps one participant's data private from another, not secrecy
+// of this key.
+//
+// >>> OPEN DECISION: these two constants currently point at the SAME Supabase project as the
+// personal file. If case-study participants should live in their own isolated project instead
+// (see the note in backend-rebuild-scope.md §6), change these two lines and run the schema there.
+// Nothing else in this file depends on which project it is.
+const SUPABASE_URL = "https://pdnvupqbbvhfcgnzflxi.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_81uOOJ29MOGsimO9mdCfzQ_DkCczKYR";
+const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// "just now" / "3 minutes ago" / "2 hours ago" / a plain date past a day — used only for the
+// account section's quiet sync-status line, so it deliberately doesn't try to handle every
+// possible span (weeks, months); a plain date is a perfectly fine fallback that far out.
+function formatRelativeTime(date) {
+  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+  if (seconds < 45) return "just now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return minutes + " minute" + (minutes === 1 ? "" : "s") + " ago";
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return hours + " hour" + (hours === 1 ? "" : "s") + " ago";
+  return date.toLocaleDateString();
+}
+
 function App() {
-  const APP_VERSION = "2026-07-24T15:00:00";
+  const APP_VERSION = "2026-07-24T20:45:00";
   const [updateAvailable, setUpdateAvailable] = useState(false);
   useEffect(function () {
     function checkVersion() {
@@ -2520,6 +2553,230 @@ function App() {
   useEffect(function () {
     if (data.pushSettings && data.pushSettings.enabled) syncPushSchedule(data);
   }, [pushScheduleKey]);
+
+  // ---- Account (Supabase auth) ----
+  // authChecked distinguishes "still finding out if there's a session" from "checked, and there
+  // isn't one" — without it, a signed-in returning visitor would flash a "not signed in" state for
+  // a moment on every load before the real session comes back. This matters more here than in the
+  // personal file, since in this file a missing session means the whole app is gated behind sign-in.
+  const [session, setSession] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  useEffect(function () {
+    supabaseClient.auth.getSession().then(function (result) {
+      setSession(result.data.session);
+      setAuthChecked(true);
+    });
+    // Keeps this in sync with sign-in/sign-out/token-refresh happening anywhere (including a
+    // magic-link tab, or a token silently refreshing in the background) — not just the direct
+    // result of a button the user just clicked in this tab.
+    const { data: authListener } = supabaseClient.auth.onAuthStateChange(function (event, newSession) {
+      setSession(newSession);
+    });
+    return function () { authListener.subscription.unsubscribe(); };
+  }, []);
+  function signUpWithEmail(email, password) {
+    return supabaseClient.auth.signUp({ email: email, password: password });
+  }
+  function signInWithEmail(email, password) {
+    return supabaseClient.auth.signInWithPassword({ email: email, password: password });
+  }
+  function signOut() {
+    return supabaseClient.auth.signOut();
+  }
+  // Uploads a snapshot of everything currently on THIS device into the signed-in account's rows —
+  // purely additive, never destructive: the app still reads from and writes to localStorage exactly
+  // as before, and nothing is ever lost by this running too often, only by it not running at all.
+  // Deliberately silent (no toast) — this runs automatically in the background, and a toast firing
+  // every few seconds of normal use would be constant noise. The manual button surfaces its own
+  // confirmation via backupToSupabaseManual below.
+  //
+  // NOTE vs the personal file: this file's account-level liked-foods field is likedFoodsByMeal
+  // (per meal slot), not the personal file's flat likedFoods array — so it writes the separate
+  // liked_foods_by_meal column and leaves liked_foods alone. An upsert only touches the columns it
+  // names, so the two files can share a profiles row without either clobbering the other's field.
+  function backupToSupabase() {
+    if (!session) return Promise.reject(new Error("Not signed in"));
+    const userId = session.user.id;
+    const profileUpsert = supabaseClient.from("profiles").upsert({
+      id: userId,
+      active_program: data.activeProgram,
+      liked_foods_by_meal: data.likedFoodsByMeal,
+      custom_foods: data.customFoods,
+      custom_program_config: data.customProgramConfig,
+      supplement_list: data.supplementList,
+      rest_timer_settings: data.restTimerSettings,
+      push_settings: data.pushSettings,
+      reminder_times: data.reminderTimes,
+      shared_exercise_state: data.sharedExerciseState,
+      shared_rir_mode_enabled: data.sharedRirModeEnabled,
+      ui_prefs: data.uiPrefs,
+    });
+    // state holds the whole per-program blob as-is — including this file's own mealRegenerateUndo
+    // and mealDateOverrides, which the personal file doesn't have. Nothing needs to know about them
+    // here: that's exactly what the JSONB hybrid design was chosen for.
+    const programUpserts = ["cutting", "cruise", "hypertrophy", "custom"].map(function (key) {
+      return supabaseClient.from("program_states").upsert(
+        { user_id: userId, program_key: key, state: data.programs[key] },
+        { onConflict: "user_id,program_key" }
+      );
+    });
+    return Promise.all([profileUpsert].concat(programUpserts)).then(function (results) {
+      const failed = results.find(function (r) { return r.error; });
+      if (failed) throw failed.error;
+      return true;
+    });
+  }
+  // Thin wrapper for the manual "Sync now" button specifically — same underlying upload, just with
+  // the toast confirmation a deliberate manual tap should still get.
+  function backupToSupabaseManual() {
+    return backupToSupabase().then(function (result) {
+      showToast("Backed up to your account");
+      return result;
+    }).catch(function (err) {
+      showToast("Backup failed \u2014 try again");
+      throw err;
+    });
+  }
+  // Automatic background backup — debounced so a burst of activity (logging several sets in a row,
+  // typing in a field) collapses into ONE sync after things settle, rather than firing on every
+  // keystroke or tap.
+  //
+  // Reads and writes never depend on any of this — localStorage (via save(), unaffected by any of
+  // it) is what the app actually shows, instantly, online or not. This is purely a background
+  // attempt to also get a copy to the cloud; when it can't, nothing about using the app changes.
+  const [lastSyncedAt, setLastSyncedAt] = useState(null);
+  const [syncStatus, setSyncStatus] = useState("idle"); // "idle" | "syncing" | "offline" | "error"
+  const autoSyncTimer = useRef(null);
+  // Blocks the automatic backup until the fresh-device check below has finished — and, if that
+  // check surfaced the "Existing data found" prompt, until the person has actually ANSWERED it.
+  //
+  // Without this gate there is a real data-loss race: signing in on a new device starts a 4-second
+  // timer that uploads this device's EMPTY state over the account's real data, while the prompt is
+  // still on screen being read. Restoring afterwards would then pull back the empty blob the backup
+  // had just written. Four seconds is far less time than it takes to read a modal and decide, so
+  // this isn't a narrow edge case — it's the likely outcome for exactly the "lost my phone" person
+  // the prompt exists to rescue.
+  const [freshDeviceCheckDone, setFreshDeviceCheckDone] = useState(false);
+  function attemptSync() {
+    // Skip the network call entirely when the browser already knows it's offline — no point
+    // waiting on a request doomed to fail, and "Offline" is a more honest status than "failed".
+    if (typeof navigator !== "undefined" && navigator.onLine === false) { setSyncStatus("offline"); return; }
+    setSyncStatus("syncing");
+    backupToSupabase().then(function () {
+      setSyncStatus("idle");
+      setLastSyncedAt(new Date());
+    }).catch(function () {
+      setSyncStatus("error");
+    });
+  }
+  useEffect(function () {
+    if (!session) return; // nothing to sync to if signed out
+    if (!freshDeviceCheckDone) return; // see freshDeviceCheckDone above — never back up over an unanswered restore prompt
+    if (autoSyncTimer.current) clearTimeout(autoSyncTimer.current);
+    autoSyncTimer.current = setTimeout(attemptSync, 4000);
+    return function () { if (autoSyncTimer.current) clearTimeout(autoSyncTimer.current); };
+  }, [data, session, freshDeviceCheckDone]);
+  // The debounced effect above only fires again on the NEXT data change — if someone goes offline,
+  // makes changes, then just closes their laptop until connectivity returns without touching the
+  // app again, nothing would otherwise notice reconnection happened. This listens for exactly that
+  // moment and retries immediately, rather than leaving a failed/offline sync stranded indefinitely.
+  useEffect(function () {
+    function handleOnline() {
+      if (session && (syncStatus === "error" || syncStatus === "offline")) attemptSync();
+    }
+    window.addEventListener("online", handleOnline);
+    return function () { window.removeEventListener("online", handleOnline); };
+  }, [session, syncStatus, data]);
+  // Pulls the account's stored data down and OVERWRITES whatever is currently on this device —
+  // the mirror image of backupToSupabase, and the more consequential direction: backup only adds
+  // to the cloud, this replaces what's local. Routes the fetched data through normalizeV2, the
+  // exact same function loadData() already uses on every normal startup, so a field the schema
+  // hasn't seen yet or a program with genuinely no saved state gets the same safe defaults it
+  // would on a fresh install — no separate, second normalization path to keep in sync.
+  function restoreFromSupabase() {
+    if (!session) return Promise.reject(new Error("Not signed in"));
+    const userId = session.user.id;
+    return Promise.all([
+      supabaseClient.from("profiles").select("*").eq("id", userId).single(),
+      supabaseClient.from("program_states").select("*").eq("user_id", userId),
+    ]).then(function (results) {
+      const profileResult = results[0];
+      const programsResult = results[1];
+      if (profileResult.error) throw profileResult.error;
+      if (programsResult.error) throw programsResult.error;
+      const profile = profileResult.data;
+      const programsByKey = {};
+      (programsResult.data || []).forEach(function (row) { programsByKey[row.program_key] = row.state; });
+      const restored = {
+        activeProgram: profile.active_program,
+        // Both shapes are handed to normalizeV2 deliberately. If this profile was last written by
+        // THIS file, liked_foods_by_meal is populated and wins. If it was written by the personal
+        // file (flat liked_foods) or predates the column entirely, normalizeV2's existing legacy
+        // path fans the flat list across all four meal slots rather than silently losing it.
+        likedFoodsByMeal: profile.liked_foods_by_meal,
+        likedFoods: profile.liked_foods,
+        customFoods: profile.custom_foods,
+        customProgramConfig: profile.custom_program_config,
+        supplementList: profile.supplement_list,
+        restTimerSettings: profile.rest_timer_settings,
+        pushSettings: profile.push_settings,
+        reminderTimes: profile.reminder_times,
+        sharedExerciseState: profile.shared_exercise_state,
+        sharedRirModeEnabled: profile.shared_rir_mode_enabled,
+        uiPrefs: profile.ui_prefs,
+        programs: {
+          cutting: programsByKey.cutting || {},
+          cruise: programsByKey.cruise || {},
+          hypertrophy: programsByKey.hypertrophy || {},
+          custom: programsByKey.custom || {},
+        },
+      };
+      save(normalizeV2(restored));
+      showToast("Restored from your account");
+      return true;
+    }).catch(function (err) {
+      showToast("Restore failed \u2014 try again");
+      throw err;
+    });
+  }
+  // Detects the exact "lost phone, signed into a fresh device" scenario: signs in, local data
+  // still looks like a brand-new install, but the account actually has real data waiting. Without
+  // this, recovering requires already knowing the Restore button exists — a bad ask for a study
+  // participant who just lost a phone and doesn't know this app's settings menu at all. Checked
+  // once per session (the ref), and never overrides anything if local data ISN'T untouched — this
+  // only ever offers to fill in emptiness, never risks silently clobbering something real.
+  const [restorePromptCloudSummary, setRestorePromptCloudSummary] = useState(null);
+  const restorePromptChecked = useRef(false);
+  useEffect(function () {
+    if (!session || restorePromptChecked.current) return;
+    restorePromptChecked.current = true;
+    const localLooksUntouched = ["cutting", "cruise", "hypertrophy", "custom"].every(function (key) {
+      const p = data.programs[key];
+      return p.currentWeek <= 1 && Object.keys(p.logs || {}).length === 0;
+    });
+    // Local data is real, so there's nothing to rescue and nothing to wait on — release the backup
+    // gate immediately rather than stalling normal syncing behind a check that doesn't apply.
+    if (!localLooksUntouched) { setFreshDeviceCheckDone(true); return; }
+    supabaseClient.from("program_states").select("program_key, state").eq("user_id", session.user.id)
+      .then(function (result) {
+        // On a failed lookup, release the gate rather than blocking backups indefinitely. Backing
+        // up is the safe default here: local data already looks untouched, so an upload can only
+        // overwrite the cloud with an empty state we were unable to prove is worth keeping — and a
+        // permanently stalled backup is the worse failure of the two.
+        if (result.error || !result.data) { setFreshDeviceCheckDone(true); return; }
+        const withRealData = result.data.filter(function (row) {
+          return row.state && (row.state.currentWeek > 1 || Object.keys(row.state.logs || {}).length > 0);
+        });
+        if (withRealData.length > 0) {
+          setRestorePromptCloudSummary(withRealData.map(function (row) {
+            return { key: row.program_key, week: row.state.currentWeek };
+          }));
+          // Gate deliberately left CLOSED here — only answering the prompt opens it.
+        } else {
+          setFreshDeviceCheckDone(true);
+        }
+      });
+  }, [session]);
 
   // ---- Withings ----
   const [withingsStatus, setWithingsStatus] = useState(null); // null = not yet checked; {connected, latest}
@@ -3763,6 +4020,19 @@ function App() {
       )
     ),
     toast && h("div", { className: "toast" }, h(Check, { size: 16 }), " " + toast),
+    // onDismiss runs on BOTH paths — "Start fresh" directly, and "Restore my data" via the
+    // component's .finally() once the restore resolves — so the backup gate opens exactly when the
+    // decision is settled, and not a moment earlier.
+    //
+    // Worth knowing about the "Start fresh" path specifically: it means the automatic backup will
+    // then upload this device's empty state over the account's saved data within a few seconds.
+    // That IS what "begin a new, separate history" implies, but it's irreversible, and the button
+    // currently says so only in passing. Worth revisiting before real participants see it.
+    restorePromptCloudSummary && h(FreshDeviceRestorePrompt, {
+      summary: restorePromptCloudSummary,
+      onRestore: restoreFromSupabase,
+      onDismiss: function () { setRestorePromptCloudSummary(null); setFreshDeviceCheckDone(true); },
+    }),
     restTimer && h("div", { className: "rest-timer-bar" },
       h("div", null,
         h("div", { style: { fontSize: 11, opacity: 0.8 } }, "Resting — " + restTimer.label),
@@ -3841,6 +4111,9 @@ function App() {
               hasOverride: groceryHasOverride,
             }),
             tab === "settings" && h(SettingsTab, {
+              session: session, authChecked: authChecked, signUpWithEmail: signUpWithEmail, signInWithEmail: signInWithEmail, signOut: signOut,
+              backupToSupabase: backupToSupabaseManual, restoreFromSupabase: restoreFromSupabase,
+              syncStatus: syncStatus, lastSyncedAt: lastSyncedAt,
               pushSettings: data.pushSettings, updatePushSettings: updatePushSettings,
               reminderTimes: data.reminderTimes, updateReminderTimes: updateReminderTimes, toggleTrainingDay: toggleTrainingDay,
               isCustomProgram: def.needsSetup === false && data.activeProgram === "custom",
@@ -5504,6 +5777,131 @@ function SettingsSeg(props) {
   );
 }
 
+// Email + password only, deliberately: it's the simplest thing that actually works, and social
+// login can be added later without disrupting anyone already using this. Rendered both inside
+// Settings (where it shows the signed-in state and a sign-out button) and, via AuthGate, as the
+// gate the whole app sits behind.
+function AccountAuthPanel(props) {
+  const [mode, setMode] = useState("signin"); // "signin" | "signup"
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [signupSent, setSignupSent] = useState(false);
+
+  if (!props.authChecked) {
+    return h("p", { style: { fontSize: 12, color: "#737373" } }, "Checking sign-in status\u2026");
+  }
+
+  if (props.session) {
+    return h("div", null,
+      h("p", { style: { fontSize: 13, margin: "0 0 10px" } }, "Signed in as " + props.session.user.email),
+      h("button", {
+        className: "ex-action-btn",
+        onClick: function () { props.signOut(); },
+      }, "Sign out")
+    );
+  }
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    if (!email || !password) { setError("Enter both an email and a password."); return; }
+    setError("");
+    setLoading(true);
+    const action = mode === "signup" ? props.signUpWithEmail(email, password) : props.signInWithEmail(email, password);
+    action.then(function (result) {
+      setLoading(false);
+      if (result.error) { setError(result.error.message); return; }
+      if (mode === "signup" && !result.data.session) {
+        // Email confirmation is on by default — no session yet until the person clicks the link in
+        // their inbox. Signing in later (once confirmed) is what actually establishes the session;
+        // this isn't a failure, just the expected next step.
+        setSignupSent(true);
+      }
+    });
+  }
+
+  if (signupSent) {
+    return h("p", { style: { fontSize: 12, color: "#4eba6f" } },
+      "Check " + email + " for a confirmation link, then come back and sign in.");
+  }
+
+  return h("form", { onSubmit: handleSubmit },
+    h("input", {
+      type: "email", placeholder: "Email", value: email, autoComplete: "email",
+      onChange: function (e) { setEmail(e.target.value); },
+      style: { width: "100%", background: "#0a0a0a", border: "1px solid #404040", borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#f5f5f5", marginBottom: 8 },
+    }),
+    h("input", {
+      type: "password", placeholder: "Password", value: password, autoComplete: mode === "signup" ? "new-password" : "current-password",
+      onChange: function (e) { setPassword(e.target.value); },
+      style: { width: "100%", background: "#0a0a0a", border: "1px solid #404040", borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "#f5f5f5", marginBottom: 8 },
+    }),
+    error && h("p", { style: { fontSize: 12, color: "#f87171", margin: "0 0 8px" } }, error),
+    h("div", { style: { display: "flex", gap: 8 } },
+      h("button", {
+        type: "submit", className: "ex-action-btn", style: { flex: 1, background: "#1d4ed8", color: "#fff", borderColor: "#1d4ed8" }, disabled: loading,
+      }, loading ? "\u2026" : mode === "signup" ? "Create account" : "Sign in"),
+      h("button", {
+        type: "button", className: "ex-action-btn", style: { flex: "0 0 auto" },
+        onClick: function () { setMode(mode === "signup" ? "signin" : "signup"); setError(""); },
+      }, mode === "signup" ? "Have an account?" : "New here?")
+    )
+  );
+}
+
+// Self-contained cloud-sync action button — its own loading state so a slow connection can't be
+// mistaken for a silent no-op, and a confirm() gate since both directions this drives (backup,
+// restore) are real, deliberate actions, not something to trigger by accident with a stray tap.
+function CloudSyncButton(props) {
+  const [loading, setLoading] = useState(false);
+  return h("button", {
+    className: "ex-action-btn", style: Object.assign({ width: "100%", marginTop: 10 }, props.danger ? { borderColor: "#f87171", color: "#f87171" } : {}), disabled: loading,
+    onClick: function () {
+      if (props.confirmMessage && !window.confirm(props.confirmMessage)) return;
+      setLoading(true);
+      props.onAction().finally(function () { setLoading(false); });
+    },
+  }, loading ? props.loadingLabel : props.label);
+}
+
+// Shown when someone signs in on a device whose local data still looks brand-new while their
+// account has real progress waiting. Deliberately a full-screen modal rather than a toast or a
+// settings-page detail: the person most likely to hit this just lost a phone and is already
+// stressed. Two clear paths — actually restore, or explicitly dismiss (e.g. this really is meant
+// to be a fresh start). Never silently auto-restores, since overwriting a genuinely-intended
+// fresh start would be its own harm.
+function FreshDeviceRestorePrompt(props) {
+  const [restoring, setRestoring] = useState(false);
+  return h("div", {
+    style: {
+      position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", display: "flex",
+      alignItems: "center", justifyContent: "center", zIndex: 2000, padding: 24,
+    },
+  },
+    h("div", { style: { background: "#171717", border: "1px solid #404040", borderRadius: 12, padding: 20, maxWidth: 360 } },
+      h("h3", { style: { margin: "0 0 10px", fontSize: 16 } }, "Existing data found"),
+      h("p", { style: { fontSize: 13, color: "#d4d4d4", lineHeight: 1.5, margin: "0 0 10px" } },
+        "This device looks new, but your account already has progress saved \u2014 e.g. " +
+        props.summary.map(function (s) { return s.key.charAt(0).toUpperCase() + s.key.slice(1) + " at week " + s.week; }).join(", ") +
+        ". Restore it here?"),
+      h("p", { style: { fontSize: 11, color: "#737373", margin: "0 0 16px" } },
+        "Only choose \u201cStart fresh\u201d if you actually mean to begin a new, separate history on this device."),
+      h("div", { style: { display: "flex", gap: 8 } },
+        h("button", {
+          className: "ex-action-btn", style: { flex: 1, background: "#1d4ed8", color: "#fff", borderColor: "#1d4ed8" },
+          disabled: restoring,
+          onClick: function () {
+            setRestoring(true);
+            props.onRestore().finally(function () { props.onDismiss(); });
+          },
+        }, restoring ? "Restoring\u2026" : "Restore my data"),
+        h("button", { className: "ex-action-btn", style: { flex: "0 0 auto" }, onClick: props.onDismiss }, "Start fresh")
+      )
+    )
+  );
+}
+
 function SettingsTab(props) {
   const ps = props.pushSettings || { enabled: false, meals: true, hydration: true, supplements: true };
   const masterOn = !!ps.enabled;
@@ -5511,14 +5909,34 @@ function SettingsTab(props) {
   const onCount = masterOn ? [ps.meals !== false, ps.hydration !== false, ps.supplements !== false].filter(Boolean).length : 0;
 
   return h("div", { style: { padding: "12px 16px" } },
-    // ---- Account (placeholder — no login/sync built yet) ----
-    h(SettingsSection, { id: "account", title: "Account", status: "Not signed in", uiPrefs: props.uiPrefs, updateUiPrefs: props.updateUiPrefs },
-      h(SettingsRow, null, h("div", null,
-        h("div", { style: { fontSize: 13 } }, "Create account"),
-        h("div", { style: { fontSize: 11, color: "#737373", marginTop: 2 } }, "Sync across devices, coordinator access")),
-        h("span", { style: { fontSize: 11, color: "#525252", border: "1px solid #333", borderRadius: 20, padding: "2px 8px" } }, "Coming soon")),
-      h(SettingsRow, { style: { borderBottom: "none" } }, h("span", { style: { fontSize: 13 } }, "Sign in"),
-        h("span", { style: { fontSize: 11, color: "#525252", border: "1px solid #333", borderRadius: 20, padding: "2px 8px" } }, "Coming soon"))
+    // ---- Account ----
+    // Signing out is available here, but note the whole app sits behind AuthGate now, so signing
+    // out returns to the sign-in screen rather than leaving someone in a signed-out app.
+    h(SettingsSection, { id: "account", title: "Account", status: (props.session ? props.session.user.email : "Not signed in"), uiPrefs: props.uiPrefs, updateUiPrefs: props.updateUiPrefs },
+      h(AccountAuthPanel, {
+        session: props.session, authChecked: props.authChecked,
+        signUpWithEmail: props.signUpWithEmail, signInWithEmail: props.signInWithEmail, signOut: props.signOut,
+      }),
+      // Backup runs automatically in the background (debounced ~4s after any change) — this status
+      // line is the only ongoing visibility into that, since the automatic path is deliberately
+      // silent to avoid a toast firing every few seconds of normal use.
+      props.session && h("p", { style: { fontSize: 11, color: props.syncStatus === "error" ? "#f87171" : "#737373", margin: "10px 0 0" } },
+        props.syncStatus === "syncing" ? "Syncing\u2026"
+          : props.syncStatus === "offline" ? "Offline \u2014 will sync once you're back online"
+          : props.syncStatus === "error" ? "Last sync failed \u2014 will retry automatically"
+          : props.lastSyncedAt ? "Last synced " + formatRelativeTime(props.lastSyncedAt)
+          : "Not yet synced this session"),
+      props.session && h(CloudSyncButton, {
+        onAction: props.backupToSupabase,
+        label: "Sync now", loadingLabel: "Syncing\u2026",
+      }),
+      props.session && h(CloudSyncButton, {
+        onAction: props.restoreFromSupabase, danger: true,
+        label: "Restore from cloud", loadingLabel: "Restoring\u2026",
+        confirmMessage: "Overwrite everything on THIS device with what's saved in your account? Only do this if this device's local data is stale, wrong, or missing \u2014 e.g. after clearing browser storage or setting up on a new device. Anything on this device not yet backed up will be lost.",
+      }),
+      h("p", { style: { fontSize: 11, color: "#737373", margin: "10px 0 0" } },
+        "Your data automatically backs up to your account as you use the app. Restore replaces what's on THIS device with your account's saved copy \u2014 useful after clearing browser storage or on a new device.")
     ),
 
     // ---- Reminders — master switch owns the subscription; the three category flags just decide
@@ -6482,34 +6900,50 @@ function CustomSetupWizard(props) {
   );
 }
 
-// ---- Access gate ----
-// Temporary, browser-side speed bump — NOT real security (anyone with dev tools can read the
-// passphrase in this file's source). Its purpose is narrower: revoke everyone's current casual
-// access to the shared link at once, until the real Account/Sign-in feature (see Settings) exists.
-// A correct passphrase, entered once per browser, sets a localStorage flag that persists across
-// reloads; nothing about the app's data or the Worker is touched by this gate.
-const ACCESS_PASSPHRASE = "In7heLabsP@ssw0rd7";
-const ACCESS_STORAGE_KEY = "itl_access_unlocked_v1"; // versioned so a future passphrase change re-locks everyone at once
+// ---- Auth gate ----
+// Replaces the old shared-passphrase gate, which was never real security: the passphrase sat in
+// this file's source in plain text, was checked entirely client-side, and was identical for every
+// participant, so it could neither keep anyone out nor tell one person from another. Access control
+// now rests on an actual Supabase identity, enforced server-side by the same Row-Level Security
+// policies that were adversarially tested with two accounts before this file was wired up.
+//
+// This gate is about IDENTITY, not secrecy — the app needs to know whose data to load before it can
+// render anything meaningful, which is why it wraps App rather than sitting inside it.
+const LEGACY_ACCESS_STORAGE_KEY = "itl_access_unlocked_v1";
 
-function AccessGate() {
-  const [unlocked, setUnlocked] = useState(function () {
-    return localStorage.getItem(ACCESS_STORAGE_KEY) === "yes";
-  });
-  const [input, setInput] = useState("");
-  const [error, setError] = useState(false);
+function AuthGate() {
+  const [session, setSession] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
 
-  function tryUnlock(e) {
-    e.preventDefault();
-    if (input === ACCESS_PASSPHRASE) {
-      localStorage.setItem(ACCESS_STORAGE_KEY, "yes");
-      setUnlocked(true);
-      setError(false);
-    } else {
-      setError(true);
-    }
+  useEffect(function () {
+    // Clear the old passphrase flag on first load after this ships. Purely housekeeping — nothing
+    // reads it anymore — but leaving stale access tokens lying around in storage is a bad habit,
+    // and its presence could confuse anyone debugging this later.
+    try { localStorage.removeItem(LEGACY_ACCESS_STORAGE_KEY); } catch (e) {}
+    supabaseClient.auth.getSession().then(function (result) {
+      setSession(result.data.session);
+      setAuthChecked(true);
+    });
+    const { data: authListener } = supabaseClient.auth.onAuthStateChange(function (event, newSession) {
+      setSession(newSession);
+    });
+    return function () { authListener.subscription.unsubscribe(); };
+  }, []);
+
+  // Deliberately renders nothing rather than the sign-in form while the session is still being
+  // resolved. Showing the form first would flash "please sign in" at someone who IS signed in on
+  // every single load — worse than a brief blank, and alarming in an app holding your training
+  // history.
+  if (!authChecked) {
+    return h("div", {
+      style: {
+        minHeight: "100vh", background: "#0a0a0a", color: "#737373", display: "flex",
+        alignItems: "center", justifyContent: "center", fontSize: 13, fontFamily: "inherit",
+      },
+    }, "Loading\u2026");
   }
 
-  if (unlocked) return h(App);
+  if (session) return h(App);
 
   return h("div", {
     style: {
@@ -6519,28 +6953,22 @@ function AccessGate() {
     },
   },
     h("img", { src: LOGO_HEADER_URI, alt: "In The Lab Fitness", style: { height: 48, marginBottom: 24 } }),
-    h("form", { onSubmit: tryUnlock, style: { width: "100%", maxWidth: 320 } },
-      h("div", { style: { fontSize: 14, color: "#a3a3a3", marginBottom: 12, textAlign: "center" } },
-        "This app is temporarily restricted while account access is being built. Enter the passphrase to continue."),
-      h("input", {
-        type: "password", value: input, autoFocus: true,
-        onChange: function (e) { setInput(e.target.value); setError(false); },
-        placeholder: "Passphrase",
-        style: {
-          width: "100%", background: "#0f0f0f", border: "1px solid " + (error ? "#f87171" : "#404040"),
-          borderRadius: 8, padding: "10px 12px", fontSize: 15, color: "#f5f5f5", marginBottom: 10,
-        },
+    h("div", { style: { width: "100%", maxWidth: 320 } },
+      h("div", { style: { fontSize: 14, color: "#a3a3a3", marginBottom: 16, textAlign: "center", lineHeight: 1.5 } },
+        "Sign in to your account, or create one, to continue."),
+      h(AccountAuthPanel, {
+        session: null, authChecked: true,
+        signUpWithEmail: function (email, password) { return supabaseClient.auth.signUp({ email: email, password: password }); },
+        signInWithEmail: function (email, password) { return supabaseClient.auth.signInWithPassword({ email: email, password: password }); },
+        signOut: function () { return supabaseClient.auth.signOut(); },
       }),
-      error && h("div", { style: { color: "#f87171", fontSize: 12, marginBottom: 10 } }, "Incorrect passphrase."),
-      h("button", {
-        type: "submit", className: "ex-action-btn",
-        style: { width: "100%", background: "#1d4ed8", borderColor: "#1d4ed8", color: "#fff", padding: "10px 0" },
-      }, "Unlock")
+      h("p", { style: { fontSize: 11, color: "#525252", marginTop: 16, textAlign: "center", lineHeight: 1.5 } },
+        "Your account keeps your program and logs backed up, so nothing is lost if you switch phones or clear your browser.")
     )
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(h(AccessGate));
+ReactDOM.createRoot(document.getElementById("root")).render(h(AuthGate));
 
 // Registers the service worker for "Add to Home Screen" installability.
 // Wrapped in a feature check and try/catch since this must never block the app itself —
