@@ -27,7 +27,7 @@
   .header-bottom p { font-size: 12px; color: #737373; margin: 0; }
   .icon-btn { background: none; border: none; color: #737373; padding: 8px; cursor: pointer; display: flex; }
   .icon-btn:hover { color: #d4d4d4; }
-  .header-actions { display: flex; gap: 4px; align-items: center; }
+  /* .header-actions removed — export/import/reset moved to Settings > Data & backup */
   .app-logo { height: 30px; width: auto; flex-shrink: 0; }
   .program-select { background: #171717; border: 2px solid #3d97d3; border-radius: 8px; font-size: 17px;
     font-weight: 700; padding: 8px 14px; cursor: pointer; color: #f5f5f5; }
@@ -246,6 +246,9 @@ function Icon(props) {
 function Dumbbell(p) { return h(Icon, p,
   h("path", { d: "M6.5 6.5 17.5 17.5" }), h("path", { d: "m21 21-1-1" }), h("path", { d: "m3 3 1 1" }),
   h("path", { d: "m18 9 3-3-3-3" }), h("path", { d: "M15 6h6" }), h("path", { d: "m6 15-3 3 3 3" }), h("path", { d: "M3 18h6" })); }
+function Gear(p) { return h(Icon, p,
+  h("circle", { cx: 12, cy: 12, r: 3 }),
+  h("path", { d: "M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" })); }
 function Droplet(p) { return h(Icon, p, h("path", { d: "M12 2.69 7.5 8.44a6 6 0 1 0 9 0L12 2.69Z" })); }
 function UtensilsCrossed(p) { return h(Icon, p,
   h("path", { d: "m16 2-2.3 2.3a3 3 0 0 0 0 4.2l1.8 1.8a3 3 0 0 0 4.2 0L22 8" }),
@@ -2065,6 +2068,8 @@ function makeDefaultData() {
     customProgramConfig: null,
     supplementList: [],
     restTimerSettings: { enabled: false, seconds: 90 }, // client-side post-set rest reminder — no backend involved
+    pushSettings: { enabled: false, meals: true, hydration: true, supplements: true }, // opt-in push reminders via the Worker — enabled is the master switch; the three flags choose which categories are included once on
+    reminderTimes: { weighIn: "", trainingTime: "", trainingDays: [] }, // user-set times for weigh-in (daily) + training (day-specific)
     // Cutting, Cruise, and Hypertrophy use identical exercise ids/names (Cruise/Hypertrophy are
     // literal copies of Cutting with only sets/cardio tweaked) — so unlike Custom, whose exercises
     // are generated per-user and don't align with anything, these three genuinely share the same
@@ -2126,6 +2131,8 @@ function normalizeV2(parsed) {
     customProgramConfig: parsed.customProgramConfig || null,
     supplementList: parsed.supplementList || [],
     restTimerSettings: Object.assign({ enabled: false, seconds: 90 }, parsed.restTimerSettings || {}),
+    pushSettings: Object.assign({ enabled: false, meals: true, hydration: true, supplements: true }, parsed.pushSettings || {}),
+    reminderTimes: Object.assign({ weighIn: "", trainingTime: "", trainingDays: [] }, parsed.reminderTimes || {}),
     sharedExerciseState: sharedExerciseState,
     sharedRirModeEnabled: !!parsed.sharedRirModeEnabled,
     uiPrefs: Object.assign({ sleepExpanded: true, supplementsBoxExpanded: false, yourSupplementsOpen: false, unscheduledSupplementsOpen: false, foodPlanExpandedMeals: { m1: false, m2: false, m3: false, m4: false }, milestonesCardExpanded: false, customFoodsExpanded: false }, parsed.uiPrefs || {}),
@@ -2182,8 +2189,100 @@ function fireRestNotification(label) {
   }
 }
 
+// ---- Push notifications: fixed-time reminders (meals / hydration / timed supplements) ----
+// The app reads the user's own times out of its existing data and syncs them to the Cloudflare
+// Worker, which fires the notifications on a 15-min cron. This is the client half; the Worker is
+// the sender. daysOfWeek is supported by the Worker (used by the training reminder below).
+const PUSH_WORKER_URL = "https://itl-fitness-worker.itlapp.workers.dev";
+const PUSH_VAPID_PUBLIC_KEY = "BG7_O-gdtwFvWvO17pGcwNO49sMHFxUmBCgyL-zyaw_MuiZ8VHrE5-V1Hd25pq390AaG7KkWqG4G_HI9Ozv5ke8";
+
+function urlB64ToUint8Array(base64String) {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(base64);
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+
+// Anonymous, persistent device id — no login, generated once, kept locally.
+function getOrCreatePushId() {
+  let id = localStorage.getItem("itl_push_id");
+  if (!id) {
+    id = "id_" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    localStorage.setItem("itl_push_id", id);
+  }
+  return id;
+}
+
+// minutes-from-midnight -> "HH:MM" (24h, zero-padded) for the Worker's parseHHMM.
+function minutesToHHMM(mins) {
+  const hh = Math.floor(mins / 60), mm = mins % 60;
+  return String(hh).padStart(2, "0") + ":" + String(mm).padStart(2, "0");
+}
+
+// Builds the schedule array the Worker checks every 15 min, from the app's own data. Reuses
+// parseMealTimeToMinutes (handles "4:00 AM", "12:00 PM", "5:45-7:00 AM" range -> start, 24h "20:30").
+// MERGE MODE: daily entries at the same time collapse into one notification. Training is day-
+// specific and kept as its own unmerged entry so its daysOfWeek stays intact.
+function buildPushSchedule(data) {
+  const byTime = {};
+  function add(hhmm, label, id) {
+    if (!byTime[hhmm]) byTime[hhmm] = { parts: [], ids: [] };
+    byTime[hhmm].parts.push(label);
+    byTime[hhmm].ids.push(id);
+  }
+  const ps = data.pushSettings || {};
+  if (ps.meals !== false) {
+    try {
+      const def = data.activeProgram === "custom"
+        ? buildCustomProgramDef(data.customProgramConfig)
+        : PROGRAM_DEFS[data.activeProgram];
+      if (def && def.mealsByWeek) {
+        const weekKeys = Object.keys(def.mealsByWeek).sort(function (a, b) { return Number(a) - Number(b); });
+        const meals = weekKeys.length ? def.mealsByWeek[weekKeys[0]] : [];
+        (meals || []).forEach(function (m) {
+          const mins = parseMealTimeToMinutes(m.time);
+          if (mins == null) return;
+          add(minutesToHHMM(mins), m.name || "Meal", "meal-" + m.id);
+        });
+      }
+    } catch (e) { /* skip meals rather than break the whole sync */ }
+  }
+  if (ps.hydration !== false) {
+    (typeof HYDRATION !== "undefined" ? HYDRATION : []).forEach(function (hy) {
+      const mins = parseMealTimeToMinutes(hy.time);
+      if (mins == null) return;
+      add(minutesToHHMM(mins), "Hydration (" + hy.label + ")", "hydration-" + hy.id);
+    });
+  }
+  if (ps.supplements !== false) {
+    (data.supplementList || []).forEach(function (supp) {
+      if (!supp || !supp.time) return;
+      const mins = parseMealTimeToMinutes(supp.time);
+      if (mins == null) return;
+      add(minutesToHHMM(mins), supp.name || "Supplement", "supp-" + supp.id);
+    });
+  }
+  const rt = data.reminderTimes || {};
+  if (rt.weighIn) {
+    const mins = parseMealTimeToMinutes(rt.weighIn);
+    if (mins != null) add(minutesToHHMM(mins), "Weigh-in", "weighin-daily");
+  }
+  const daily = Object.keys(byTime).sort().map(function (hhmm) {
+    const g = byTime[hhmm];
+    return { id: g.ids.slice().sort().join("+"), time: hhmm, label: g.parts.join(", ") };
+  });
+  const extra = [];
+  if (rt.trainingTime && Array.isArray(rt.trainingDays) && rt.trainingDays.length) {
+    const mins = parseMealTimeToMinutes(rt.trainingTime);
+    if (mins != null) extra.push({ id: "training", time: minutesToHHMM(mins), label: "Training", daysOfWeek: rt.trainingDays.slice().sort(function (a, b) { return a - b; }) });
+  }
+  return daily.concat(extra);
+}
+
 function App() {
-  const APP_VERSION = "2026-07-22T07:12:16";
+  const APP_VERSION = "2026-07-23T20:59:18";
   const [updateAvailable, setUpdateAvailable] = useState(false);
   useEffect(function () {
     function checkVersion() {
@@ -2269,6 +2368,98 @@ function App() {
       Notification.requestPermission();
     }
   }
+
+  // ---- Push reminders (meals / hydration / timed supplements / weigh-in / training) ----
+  async function syncPushSchedule(currentData) {
+    if (!currentData.pushSettings || !currentData.pushSettings.enabled) return;
+    if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    if (!("serviceWorker" in navigator) || !("PushManager" in window)) return;
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.getSubscription();
+      if (!sub) return;
+      await fetch(PUSH_WORKER_URL + "/subscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: getOrCreatePushId(),
+          subscription: sub.toJSON(),
+          schedule: buildPushSchedule(currentData),
+          timezoneOffsetMinutes: new Date().getTimezoneOffset(),
+        }),
+      });
+    } catch (e) { /* network hiccup — re-syncs on next change or reload */ }
+  }
+  async function subscribeToPush() {
+    if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+      setToast("Notifications aren't supported in this browser");
+      return false;
+    }
+    const permission = await Notification.requestPermission();
+    if (permission !== "granted") { setToast("Notification permission not granted"); return false; }
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlB64ToUint8Array(PUSH_VAPID_PUBLIC_KEY),
+    });
+    await fetch(PUSH_WORKER_URL + "/subscribe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: getOrCreatePushId(),
+        subscription: sub.toJSON(),
+        schedule: buildPushSchedule(data),
+        timezoneOffsetMinutes: new Date().getTimezoneOffset(),
+      }),
+    });
+    return true;
+  }
+  async function unsubscribeFromPush() {
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.getSubscription();
+      if (sub) await sub.unsubscribe();
+    } catch (e) {}
+    try {
+      await fetch(PUSH_WORKER_URL + "/unsubscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: getOrCreatePushId() }),
+      });
+    } catch (e) {}
+  }
+  function updatePushSettings(patch) {
+    const cur = data.pushSettings || { enabled: false, meals: true, hydration: true, supplements: true };
+    if (patch.enabled === true && !cur.enabled) {
+      subscribeToPush().then(function (ok) {
+        save(Object.assign({}, data, { pushSettings: Object.assign({}, cur, { enabled: !!ok }) }));
+        if (ok) showToast("Reminders on");
+      });
+      return;
+    }
+    if (patch.enabled === false && cur.enabled) {
+      unsubscribeFromPush();
+      showToast("Reminders off");
+    }
+    save(Object.assign({}, data, { pushSettings: Object.assign({}, cur, patch) }));
+  }
+  function updateReminderTimes(patch) {
+    const cur = data.reminderTimes || { weighIn: "", trainingTime: "", trainingDays: [] };
+    save(Object.assign({}, data, { reminderTimes: Object.assign({}, cur, patch) }));
+  }
+  function toggleTrainingDay(dow) {
+    const cur = data.reminderTimes || {};
+    const days = (cur.trainingDays || []).slice();
+    const i = days.indexOf(dow);
+    if (i === -1) days.push(dow); else days.splice(i, 1);
+    updateReminderTimes({ trainingDays: days });
+  }
+  const pushScheduleKey = (data.pushSettings && data.pushSettings.enabled)
+    ? JSON.stringify(buildPushSchedule(data)) : "";
+  useEffect(function () {
+    if (data.pushSettings && data.pushSettings.enabled) syncPushSchedule(data);
+  }, [pushScheduleKey]);
+
   // Persists manual collapse/expand toggles (Sleep, Supplements box, Your/Unscheduled Supplements)
   // so they stay exactly as left across tab switches, rather than resetting on every remount.
   function updateUiPrefs(patch) {
@@ -2679,6 +2870,7 @@ function App() {
   const activeMeals = meals.filter(function (m) { const e = nToday[m.id]; return !e || e.status !== "skip"; });
   const activeMealTotals = activeMeals.reduce(function (a, m) { return { cal: a.cal + m.cal, p: a.p + m.p, c: a.c + m.c, f: a.f + m.f }; }, { cal: 0, p: 0, c: 0, f: 0 });
   const todaysFoodLog = prog.foodLog[nutritionSelectedDate] || [];
+  const quickAddFoods = computeQuickAddFoods(prog.foodLog, 8); // recent/frequent foods for one-tap re-log
   const macroProgress = meals.reduce(function (a, m) {
     const e = nToday[m.id];
     if (!e || e.status === "skip") return a;
@@ -3336,16 +3528,13 @@ function App() {
       onClick: function () { window.location.reload(); },
     }, "A new version is available — tap to refresh"),
     h("header", { className: "header" },
-      h("div", { className: "header-top" },
+      h("div", { className: "header-top", style: { display: "flex", justifyContent: "space-between", alignItems: "center" } },
         h("img", { src: LOGO_HEADER_URI, className: "app-logo", alt: "In The Lab Fitness" }),
-        h("div", { className: "header-actions" },
-          h("button", { className: "icon-btn", onClick: exportData, "aria-label": "Export data" }, h(Download, { size: 18 })),
-          h("label", { className: "icon-btn", style: { cursor: "pointer" } },
-            h(Upload, { size: 18 }),
-            h("input", { type: "file", accept: "application/json", style: { display: "none" }, onChange: function (e) { if (e.target.files[0]) importData(e.target.files[0]); } })
-          ),
-          h("button", { className: "icon-btn", onClick: resetAll, "aria-label": "Reset progress" }, h(RotateCcw, { size: 18 }))
-        )
+        h("button", {
+          className: "icon-btn", "aria-label": "Settings",
+          style: tab === "settings" ? { color: "#60a5fa" } : {},
+          onClick: function () { setTab(tab === "settings" ? "workouts" : "settings"); },
+        }, h(Gear, { size: 22 }))
       ),
       h("div", { className: "header-bottom" },
         h("select", {
@@ -3398,6 +3587,7 @@ function App() {
               nToday: nToday, setMealStatus: setMealStatus, clearMealStatus: clearMealStatus, macroProgress: macroProgress, meals: meals, mealTotals: activeMealTotals,
               hasOverride: nutritionHasOverride,
               foodLog: todaysFoodLog, logFood: logFood, removeFoodLogEntry: removeFoodLogEntry, updateFoodLogGrams: updateFoodLogGrams,
+              quickFoods: quickAddFoods,
               allFoods: allFoods, completeNutritionDay: completeNutritionDay, nutritionHistory: nutritionHistory,
               addCustomFood: addCustomFood, removeCustomFood: removeCustomFood, customFoods: data.customFoods || [],
               dayComplete: !!(prog.nutritionDayComplete || {})[nutritionSelectedDate],
@@ -3439,38 +3629,16 @@ function App() {
               rotationWeek: rotationWeek, displayWeek: groceryDisplayWeek, viewWeek: groceryViewWeek, setViewWeek: setGroceryViewWeek,
               hasOverride: groceryHasOverride,
             }),
-            def.needsSetup === false && data.activeProgram === "custom" && h("div", { style: { margin: "16px" } },
-              h("div", { style: { display: "flex", gap: 8, flexWrap: "wrap" } },
-                h("button", { className: "ex-action-btn", onClick: function () { setShowEditProgramSettings(!showEditProgramSettings); } }, "Edit Program Settings"),
-                h("button", { className: "reset-list-btn", style: { flex: 1, marginBottom: 0 }, onClick: resetCustomSetup }, "Redo Custom program setup")
-              ),
-              showEditProgramSettings && h(EditProgramSettingsForm, {
-                config: data.customProgramConfig,
-                onSave: function (newWeight, newActivity, newDietStyle) {
-                  updateProgramSettings(newWeight, newActivity, newDietStyle);
-                  setShowEditProgramSettings(false);
-                },
-                rirModeEnabled: rirModeEnabled, onToggleRirMode: toggleRirMode,
-              })
-            ),
-            // Cutting/Cruise/Hypertrophy don't have a wizard, so there's no weight/activity/diet-
-            // style to recalculate here — this panel exists purely to carry the RIR mode toggle,
-            // shared across all three the same way their exercise progression already is.
-            isSharedProgram && h("div", { style: { margin: "16px" } },
-              h("button", {
-                className: "ex-action-btn", style: { width: "100%" },
-                onClick: function () { setShowEditProgramSettings(!showEditProgramSettings); },
-              }, "Edit Program Settings"),
-              showEditProgramSettings && h("div", { style: { marginTop: 8 } },
-                h("div", { className: "food-cat-title" }, "RIR Mode"),
-                h("p", { style: { fontSize: "11px", color: "#737373", margin: "4px 0 8px" } },
-                  "Instead of a fixed rep range, your target rep count builds from what you actually logged last week, following a progressive schedule that pushes closer to failure across each phase and eases off again after each deload. Existing per-set weight adjustments turn off while this is on — reps are typed in exactly as they already are, nothing new to enter. Shared across Cutting, Cruise, and Hypertrophy, same as your exercise progression already is."),
-                h("button", {
-                  className: "ex-action-btn", style: { width: "100%" },
-                  onClick: toggleRirMode,
-                }, rirModeEnabled ? "Turn Off RIR Mode" : "Turn On RIR Mode")
-              )
-            )
+            tab === "settings" && h(SettingsTab, {
+              pushSettings: data.pushSettings, updatePushSettings: updatePushSettings,
+              reminderTimes: data.reminderTimes, updateReminderTimes: updateReminderTimes, toggleTrainingDay: toggleTrainingDay,
+              isCustomProgram: def.needsSetup === false && data.activeProgram === "custom",
+              isSharedProgram: isSharedProgram, activeProgramLabel: def.label, rirModeEnabled: rirModeEnabled, toggleRirMode: toggleRirMode,
+              showEditProgramSettings: showEditProgramSettings, setShowEditProgramSettings: setShowEditProgramSettings,
+              resetCustomSetup: resetCustomSetup, customProgramConfig: data.customProgramConfig, updateProgramSettings: updateProgramSettings,
+              uiPrefs: data.uiPrefs, updateUiPrefs: updateUiPrefs,
+              exportData: exportData, importData: importData, resetAll: resetAll,
+            })
           ),
           h("nav", { className: "navbar" },
             h(TabButton, { Icon: Dumbbell, label: "Workouts", active: tab === "workouts", onClick: function () { setTab("workouts"); } }),
@@ -4981,7 +5149,7 @@ function NutritionTab(props) {
         });
       })
     ),
-    h(FoodSearchLog, { foodLog: props.foodLog, logFood: props.logFood, removeEntry: props.removeFoodLogEntry, updateGrams: props.updateFoodLogGrams, allFoods: props.allFoods, addCustomFood: props.addCustomFood }),
+    h(FoodSearchLog, { foodLog: props.foodLog, logFood: props.logFood, removeEntry: props.removeFoodLogEntry, updateGrams: props.updateFoodLogGrams, allFoods: props.allFoods, addCustomFood: props.addCustomFood, quickFoods: props.quickFoods }),
     !isFutureDay && h("button", { className: "complete-btn", style: { marginBottom: 16 }, onClick: props.completeNutritionDay },
       props.dayComplete ? "✓ Logged — Update" : "Complete This Day"),
     h(SupplementManager, { supplementList: props.supplementList, addSupplement: props.addSupplement, removeSupplement: props.removeSupplement, uiPrefs: props.uiPrefs, updateUiPrefs: props.updateUiPrefs }),
@@ -5010,6 +5178,183 @@ function NutritionTab(props) {
   );
 }
 
+// Collapsible section for the Settings tab. Open/closed state persists through the same
+// updateUiPrefs mechanism already used for Sleep/Supplements collapse state, keyed per section id,
+// so it survives tab switches and reloads exactly like those do.
+function SettingsSection(props) {
+  const key = "settingsOpen_" + props.id;
+  const open = props.uiPrefs && props.uiPrefs[key] != null ? props.uiPrefs[key] : !!props.defaultOpen;
+  return h("div", { className: "panel", style: { marginBottom: 10, padding: 0, background: "#0f0f0f", border: "1px solid #404040", borderRadius: 10, overflow: "hidden" } },
+    h("div", {
+      style: { display: "flex", alignItems: "center", gap: 10, padding: "14px", cursor: "pointer", userSelect: "none" },
+      onClick: function () { props.updateUiPrefs({ [key]: !open }); },
+    },
+      h("span", { style: { fontSize: 14, fontWeight: 600, flex: 1 } }, props.title),
+      props.status != null && h("span", { style: { fontSize: 12, color: props.statusOn ? "#60a5fa" : "#737373" } }, props.status),
+      h("span", { style: { fontSize: 12, color: "#737373", transform: open ? "rotate(90deg)" : "none", display: "inline-block" } }, "\u203A")
+    ),
+    open && h("div", { style: { padding: "2px 14px 14px", borderTop: "1px solid #262626" } }, props.children)
+  );
+}
+
+function SettingsRow(props) {
+  return h("div", { style: Object.assign({ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderBottom: "1px solid #262626" }, props.style || {}) }, props.children);
+}
+
+function SettingsSeg(props) {
+  return h("div", { style: { display: "flex", gap: 6 } },
+    h("button", {
+      className: "ex-action-btn",
+      style: Object.assign({ flex: "0 0 auto", padding: "6px 14px" }, props.on ? { background: "#1d4ed8", color: "#fff", borderColor: "#1d4ed8" } : {}),
+      onClick: function () { props.onChange(true); },
+    }, "On"),
+    h("button", {
+      className: "ex-action-btn",
+      style: Object.assign({ flex: "0 0 auto", padding: "6px 14px" }, !props.on ? { background: "#262626", color: "#fff" } : {}),
+      onClick: function () { props.onChange(false); },
+    }, "Off")
+  );
+}
+
+function SettingsTab(props) {
+  const ps = props.pushSettings || { enabled: false, meals: true, hydration: true, supplements: true };
+  const masterOn = !!ps.enabled;
+  const rt = props.reminderTimes || { weighIn: "", trainingTime: "", trainingDays: [] };
+  const onCount = masterOn ? [ps.meals !== false, ps.hydration !== false, ps.supplements !== false].filter(Boolean).length : 0;
+
+  return h("div", { style: { padding: "12px 16px" } },
+    // ---- Account (placeholder — no login/sync built yet) ----
+    h(SettingsSection, { id: "account", title: "Account", status: "Not signed in", uiPrefs: props.uiPrefs, updateUiPrefs: props.updateUiPrefs },
+      h(SettingsRow, null, h("div", null,
+        h("div", { style: { fontSize: 13 } }, "Create account"),
+        h("div", { style: { fontSize: 11, color: "#737373", marginTop: 2 } }, "Sync across devices, coordinator access")),
+        h("span", { style: { fontSize: 11, color: "#525252", border: "1px solid #333", borderRadius: 20, padding: "2px 8px" } }, "Coming soon")),
+      h(SettingsRow, { style: { borderBottom: "none" } }, h("span", { style: { fontSize: 13 } }, "Sign in"),
+        h("span", { style: { fontSize: 11, color: "#525252", border: "1px solid #333", borderRadius: 20, padding: "2px 8px" } }, "Coming soon"))
+    ),
+
+    // ---- Reminders — master switch owns the subscription; the three category flags just decide
+    // what's included in the schedule once it's on. ----
+    h(SettingsSection, { id: "reminders", title: "Reminders", status: masterOn ? onCount + " on" : "Off", statusOn: masterOn, defaultOpen: true, uiPrefs: props.uiPrefs, updateUiPrefs: props.updateUiPrefs },
+      h(SettingsRow, null,
+        h("div", null, h("div", { style: { fontSize: 13 } }, "All reminders"),
+          h("div", { style: { fontSize: 11, color: "#737373", marginTop: 2 } }, "Master switch for meals, hydration, supplements, weigh-in and training")),
+        h(SettingsSeg, { on: masterOn, onChange: function (v) { props.updatePushSettings({ enabled: v }); } })
+      ),
+      masterOn && h("div", { style: { marginTop: 6 } },
+        h(SettingsRow, null, h("div", null, h("div", { style: { fontSize: 13 } }, "Meals"), h("div", { style: { fontSize: 11, color: "#737373", marginTop: 2 } }, "At your meal times")),
+          h(SettingsSeg, { on: ps.meals !== false, onChange: function (v) { props.updatePushSettings({ meals: v }); } })),
+        h(SettingsRow, null, h("div", null, h("div", { style: { fontSize: 13 } }, "Hydration"), h("div", { style: { fontSize: 11, color: "#737373", marginTop: 2 } }, "At each checkpoint")),
+          h(SettingsSeg, { on: ps.hydration !== false, onChange: function (v) { props.updatePushSettings({ hydration: v }); } })),
+        h(SettingsRow, null, h("div", null, h("div", { style: { fontSize: 13 } }, "Supplements"), h("div", { style: { fontSize: 11, color: "#737373", marginTop: 2 } }, "At your timed doses")),
+          h(SettingsSeg, { on: ps.supplements !== false, onChange: function (v) { props.updatePushSettings({ supplements: v }); } })),
+        h("div", { style: { marginTop: 10, borderTop: "1px solid #262626", paddingTop: 10 } },
+          h(SettingsRow, null, h("span", { style: { fontSize: 13 } }, "Daily weigh-in"),
+            h("input", { type: "time", value: rt.weighIn || "", onChange: function (e) { props.updateReminderTimes({ weighIn: e.target.value }); },
+              style: { background: "#0a0a0a", border: "1px solid #404040", borderRadius: 6, padding: "6px 8px", fontSize: 14, color: "#f5f5f5" } })),
+          h(SettingsRow, { style: { borderBottom: "none" } }, h("span", { style: { fontSize: 13 } }, "Training"),
+            h("input", { type: "time", value: rt.trainingTime || "", onChange: function (e) { props.updateReminderTimes({ trainingTime: e.target.value }); },
+              style: { background: "#0a0a0a", border: "1px solid #404040", borderRadius: 6, padding: "6px 8px", fontSize: 14, color: "#f5f5f5" } })),
+          h("div", { style: { display: "flex", gap: 4, justifyContent: "space-between", marginTop: 8 } },
+            ["S", "M", "T", "W", "T", "F", "S"].map(function (lbl, dow) {
+              const on = (rt.trainingDays || []).indexOf(dow) !== -1;
+              return h("button", { key: dow, onClick: function () { props.toggleTrainingDay(dow); }, className: "ex-action-btn",
+                style: Object.assign({ flex: 1, padding: "6px 0", fontSize: 12 }, on ? { background: "#1d4ed8", color: "#fff", borderColor: "#1d4ed8" } : {}) }, lbl);
+            })
+          ),
+          h("p", { style: { fontSize: 11, color: "#737373", margin: "8px 0 0" } }, "Leave a time blank to skip that reminder. Training fires only on the selected days.")
+        )
+      )
+    ),
+
+    // ---- Program (moved here from rendering on every tab). Custom programs keep their real
+    // EditProgramSettingsForm (weight/activity/diet-style recalculation) — this case-study version
+    // has that feature and the personal file doesn't, so it's preserved rather than flattened. ----
+    h(SettingsSection, { id: "program", title: "Program", status: props.activeProgramLabel + (props.rirModeEnabled ? " \u00b7 RIR on" : ""), uiPrefs: props.uiPrefs, updateUiPrefs: props.updateUiPrefs },
+      props.isCustomProgram && h("div", null,
+        h("div", { style: { display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 } },
+          h("button", { className: "ex-action-btn", onClick: function () { props.setShowEditProgramSettings(!props.showEditProgramSettings); } }, props.showEditProgramSettings ? "Hide edit form" : "Edit program settings"),
+          h("button", { className: "reset-list-btn", style: { flex: 1, marginBottom: 0 }, onClick: props.resetCustomSetup }, "Redo custom setup")
+        ),
+        props.showEditProgramSettings && h(EditProgramSettingsForm, {
+          config: props.customProgramConfig,
+          onSave: function (newWeight, newActivity, newDietStyle) {
+            props.updateProgramSettings(newWeight, newActivity, newDietStyle);
+            props.setShowEditProgramSettings(false);
+          },
+          rirModeEnabled: props.rirModeEnabled, onToggleRirMode: props.toggleRirMode,
+        })
+      ),
+      props.isSharedProgram && h("div", null,
+        h(SettingsRow, { style: { borderBottom: "none" } },
+          h("div", null, h("div", { style: { fontSize: 13 } }, "RIR mode"),
+            h("div", { style: { fontSize: 11, color: "#737373", marginTop: 2, maxWidth: 220 } }, "Autoregulate reps from what you logged last week instead of a fixed range. Shared across Cutting, Cruise, and Hypertrophy.")),
+          h(SettingsSeg, { on: props.rirModeEnabled, onChange: function () { props.toggleRirMode(); } })
+        )
+      )
+    ),
+
+    // ---- Integrations (placeholder — wearables and smart scale are backlog items, not built) ----
+    h(SettingsSection, { id: "integrations", title: "Integrations", status: "None connected", uiPrefs: props.uiPrefs, updateUiPrefs: props.updateUiPrefs },
+      h(SettingsRow, null, h("div", null,
+        h("div", { style: { fontSize: 13 } }, "Wearable (HRV, recovery)"),
+        h("div", { style: { fontSize: 11, color: "#737373", marginTop: 2 } }, "Whoop, Oura, Garmin, Apple Watch")),
+        h("span", { style: { fontSize: 11, color: "#525252", border: "1px solid #333", borderRadius: 20, padding: "2px 8px" } }, "Coming soon")),
+      h(SettingsRow, { style: { borderBottom: "none" } }, h("div", null,
+        h("div", { style: { fontSize: 13 } }, "Smart scale"),
+        h("div", { style: { fontSize: 11, color: "#737373", marginTop: 2 } }, "Withings \u2014 weight and body fat")),
+        h("span", { style: { fontSize: 11, color: "#525252", border: "1px solid #333", borderRadius: 20, padding: "2px 8px" } }, "Coming soon"))
+    ),
+
+    // ---- Display ----
+    h(SettingsSection, { id: "display", title: "Display", status: (props.uiPrefs && props.uiPrefs.expandAllDefault) ? "Expanded" : "Compact", uiPrefs: props.uiPrefs, updateUiPrefs: props.updateUiPrefs },
+      h(SettingsRow, { style: { borderBottom: "none" } },
+        h("div", null, h("div", { style: { fontSize: 13 } }, "Expand all cards by default"),
+          h("div", { style: { fontSize: 11, color: "#737373", marginTop: 2 } }, "Start each page fully open")),
+        h(SettingsSeg, { on: !!(props.uiPrefs && props.uiPrefs.expandAllDefault), onChange: function (v) { props.updateUiPrefs({ expandAllDefault: v }); } })
+      )
+    ),
+
+    // ---- Data & backup (moved here from the header icon row) ----
+    h(SettingsSection, { id: "data", title: "Data & backup", uiPrefs: props.uiPrefs, updateUiPrefs: props.updateUiPrefs },
+      h(SettingsRow, null, h("button", { className: "ex-action-btn", style: { width: "100%", textAlign: "left" }, onClick: props.exportData }, "Export backup")),
+      h(SettingsRow, null,
+        h("label", { className: "ex-action-btn", style: { width: "100%", textAlign: "left", cursor: "pointer", display: "block" } },
+          "Import backup",
+          h("input", { type: "file", accept: "application/json", style: { display: "none" }, onChange: function (e) { if (e.target.files[0]) props.importData(e.target.files[0]); } })
+        )
+      ),
+      h(SettingsRow, { style: { borderBottom: "none" } },
+        h("button", { className: "ex-action-btn", style: { width: "100%", textAlign: "left", color: "#f87171", borderColor: "#5b2626" }, onClick: props.resetAll }, "Reset progress\u2026"))
+    )
+  );
+}
+
+// Derives a short quick-add list from the full food-log history (all dates for the active program):
+// the most-recently-logged distinct foods, each keeping its last grams + per100 so a tap re-logs
+// with sensible defaults. `count` (how often the food appears) is retained for future frequency
+// weighting. Pure — safe to call in render.
+function computeQuickAddFoods(foodLogByDate, limit) {
+  limit = limit || 8;
+  const byName = {};
+  Object.keys(foodLogByDate || {}).forEach(function (dateKey) {
+    (foodLogByDate[dateKey] || []).forEach(function (e) {
+      if (!e || !e.name) return;
+      const ts = parseInt(String(e.id).split("-")[0], 10) || 0;
+      const cur = byName[e.name];
+      if (!cur) {
+        byName[e.name] = { name: e.name, grams: e.grams, per100: e.per100 || null, count: 1, lastTs: ts };
+      } else {
+        cur.count += 1;
+        if (ts >= cur.lastTs) { cur.lastTs = ts; cur.grams = e.grams; cur.per100 = e.per100 || cur.per100; }
+      }
+    });
+  });
+  return Object.keys(byName).map(function (k) { return byName[k]; })
+    .sort(function (a, b) { return b.lastTs - a.lastTs; })
+    .slice(0, limit);
+}
+
 function FoodSearchLog(props) {
   const [query, setQuery] = useState("");
   const db = props.allFoods || FOOD_DB;
@@ -5018,6 +5363,19 @@ function FoodSearchLog(props) {
     : [];
   return h("div", { style: { marginBottom: 24 } },
     h("div", { className: "food-cat-title" }, "Log Anything Else"),
+    props.quickFoods && props.quickFoods.length > 0 && h("div", { style: { marginBottom: 12 } },
+      h("div", { style: { fontSize: 11, color: "#737373", marginBottom: 6 } }, "Quick add"),
+      h("div", { style: { display: "flex", flexWrap: "wrap", gap: 6 } },
+        props.quickFoods.map(function (qf) {
+          return h("button", {
+            key: qf.name,
+            className: "ex-action-btn",
+            style: { flex: "0 0 auto", padding: "6px 12px", fontSize: 13 },
+            onClick: function () { props.logFood(qf.name, qf.grams || 100, qf.per100); },
+          }, qf.name + (qf.grams ? " · " + qf.grams + "g" : ""));
+        })
+      )
+    ),
     h(BarcodeLogger, { logFood: props.logFood, addCustomFood: props.addCustomFood, allFoods: props.allFoods }),
     h("input", {
       type: "text", value: query, onChange: function (e) { setQuery(e.target.value); },
@@ -5740,7 +6098,65 @@ function CustomSetupWizard(props) {
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(h(App));
+// ---- Access gate ----
+// Temporary, browser-side speed bump — NOT real security (anyone with dev tools can read the
+// passphrase in this file's source). Its purpose is narrower: revoke everyone's current casual
+// access to the shared link at once, until the real Account/Sign-in feature (see Settings) exists.
+// A correct passphrase, entered once per browser, sets a localStorage flag that persists across
+// reloads; nothing about the app's data or the Worker is touched by this gate.
+const ACCESS_PASSPHRASE = "In7heLabsP@ssw0rd7";
+const ACCESS_STORAGE_KEY = "itl_access_unlocked_v1"; // versioned so a future passphrase change re-locks everyone at once
+
+function AccessGate() {
+  const [unlocked, setUnlocked] = useState(function () {
+    return localStorage.getItem(ACCESS_STORAGE_KEY) === "yes";
+  });
+  const [input, setInput] = useState("");
+  const [error, setError] = useState(false);
+
+  function tryUnlock(e) {
+    e.preventDefault();
+    if (input === ACCESS_PASSPHRASE) {
+      localStorage.setItem(ACCESS_STORAGE_KEY, "yes");
+      setUnlocked(true);
+      setError(false);
+    } else {
+      setError(true);
+    }
+  }
+
+  if (unlocked) return h(App);
+
+  return h("div", {
+    style: {
+      minHeight: "100vh", background: "#0a0a0a", color: "#f5f5f5", display: "flex",
+      flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24,
+      fontFamily: "inherit",
+    },
+  },
+    h("img", { src: LOGO_HEADER_URI, alt: "In The Lab Fitness", style: { height: 48, marginBottom: 24 } }),
+    h("form", { onSubmit: tryUnlock, style: { width: "100%", maxWidth: 320 } },
+      h("div", { style: { fontSize: 14, color: "#a3a3a3", marginBottom: 12, textAlign: "center" } },
+        "This app is temporarily restricted while account access is being built. Enter the passphrase to continue."),
+      h("input", {
+        type: "password", value: input, autoFocus: true,
+        onChange: function (e) { setInput(e.target.value); setError(false); },
+        placeholder: "Passphrase",
+        style: {
+          width: "100%", background: "#0f0f0f", border: "1px solid " + (error ? "#f87171" : "#404040"),
+          borderRadius: 8, padding: "10px 12px", fontSize: 15, color: "#f5f5f5", marginBottom: 10,
+        },
+      }),
+      error && h("div", { style: { color: "#f87171", fontSize: 12, marginBottom: 10 } }, "Incorrect passphrase."),
+      h("button", {
+        type: "submit", className: "ex-action-btn",
+        style: { width: "100%", background: "#1d4ed8", borderColor: "#1d4ed8", color: "#fff", padding: "10px 0" },
+      }, "Unlock")
+    )
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(h(AccessGate));
 
 // Registers the service worker for "Add to Home Screen" installability.
 // Wrapped in a feature check and try/catch since this must never block the app itself —
