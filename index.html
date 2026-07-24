@@ -2081,7 +2081,7 @@ function makeDefaultData() {
     supplementList: [],
     restTimerSettings: { enabled: false, seconds: 90 }, // client-side post-set rest reminder — no backend involved
     pushSettings: { enabled: false, meals: true, hydration: true, supplements: true }, // opt-in push reminders via the Worker — enabled is the master switch; the three flags choose which categories are included once on
-    reminderTimes: { weighIn: "", trainingTime: "", trainingDays: [] }, // user-set times for weigh-in (daily) + training (day-specific)
+    reminderTimes: { weighIn: "", trainingTime: "", trainingDays: [], bfCheckIn: "" }, // user-set times for weigh-in (daily) + training (day-specific) + body-fat check-in (conditional)
     // Cutting, Cruise, and Hypertrophy use identical exercise ids/names (Cruise/Hypertrophy are
     // literal copies of Cutting with only sets/cardio tweaked) — so unlike Custom, whose exercises
     // are generated per-user and don't align with anything, these three genuinely share the same
@@ -2144,7 +2144,7 @@ function normalizeV2(parsed) {
     supplementList: parsed.supplementList || [],
     restTimerSettings: Object.assign({ enabled: false, seconds: 90 }, parsed.restTimerSettings || {}),
     pushSettings: Object.assign({ enabled: false, meals: true, hydration: true, supplements: true }, parsed.pushSettings || {}),
-    reminderTimes: Object.assign({ weighIn: "", trainingTime: "", trainingDays: [] }, parsed.reminderTimes || {}),
+    reminderTimes: Object.assign({ weighIn: "", trainingTime: "", trainingDays: [], bfCheckIn: "" }, parsed.reminderTimes || {}),
     sharedExerciseState: sharedExerciseState,
     sharedRirModeEnabled: !!parsed.sharedRirModeEnabled,
     uiPrefs: Object.assign({ sleepExpanded: true, supplementsBoxExpanded: false, yourSupplementsOpen: false, unscheduledSupplementsOpen: false, foodPlanExpandedMeals: { m1: false, m2: false, m3: false, m4: false }, milestonesCardExpanded: false, customFoodsExpanded: false }, parsed.uiPrefs || {}),
@@ -2281,6 +2281,23 @@ function buildPushSchedule(data) {
     const mins = parseMealTimeToMinutes(rt.weighIn);
     if (mins != null) add(minutesToHHMM(mins), "Weigh-in", "weighin-daily");
   }
+  // Body-fat check-in — conditional, not merely time-based: only included in the schedule while
+  // THIS training week's bf% hasn't been logged yet (in prog.milestoneActuals, from the Milestones
+  // tab). Reads the live program state, not the static PROGRAM_DEFS, since this depends on actual
+  // logged data. Once bf% gets logged, the next resync (the existing effect already re-syncs
+  // whenever buildPushSchedule's output changes) naturally drops this entry — no separate
+  // "cancel" logic needed, and no day-of-week restriction, since the milestone week isn't tied to
+  // a specific calendar day.
+  if (rt.bfCheckIn) {
+    const activeProg = data.programs && data.programs[data.activeProgram];
+    const currentWeek = activeProg && activeProg.currentWeek;
+    const weekActuals = activeProg && activeProg.milestoneActuals && currentWeek != null ? activeProg.milestoneActuals[currentWeek] : null;
+    const bfAlreadyLogged = weekActuals && weekActuals.bf != null && weekActuals.bf !== "";
+    if (!bfAlreadyLogged) {
+      const mins = parseMealTimeToMinutes(rt.bfCheckIn);
+      if (mins != null) add(minutesToHHMM(mins), "Log this week's body fat %", "bf-checkin");
+    }
+  }
   const daily = Object.keys(byTime).sort().map(function (hhmm) {
     const g = byTime[hhmm];
     return { id: g.ids.slice().sort().join("+"), time: hhmm, label: g.parts.join(", ") };
@@ -2294,7 +2311,7 @@ function buildPushSchedule(data) {
 }
 
 function App() {
-  const APP_VERSION = "2026-07-24T01:05:00";
+  const APP_VERSION = "2026-07-24T02:00:00";
   const [updateAvailable, setUpdateAvailable] = useState(false);
   useEffect(function () {
     function checkVersion() {
@@ -4055,7 +4072,12 @@ function WorkoutsTab(props) {
   });
 
   return h("div", null,
-    props.readinessSignal && props.readinessSignal.level !== "normal" && h("div", { className: "preview-banner", style: { marginBottom: 16 } },
+    // Suppressed whenever a deload recommendation is showing for this week — that's already the
+    // more authoritative, actionable version of "take it easier," so a second, weaker daily nudge
+    // saying nearly the same thing on top of it is redundant rather than additionally useful.
+    props.readinessSignal && props.readinessSignal.level !== "normal" &&
+      !(props.deloadRecommendation && props.deloadRecommendation.forWeek === props.data.currentWeek) &&
+      h("div", { className: "preview-banner", style: { marginBottom: 16 } },
       h("p", { style: { margin: "0 0 4px", fontWeight: 600 } },
         props.readinessSignal.level === "low" ? "Today might be a lighter day" : "Worth keeping an eye on today"),
       h("p", { style: { margin: 0, fontSize: 13 } }, "Based on " + props.readinessSignal.reasons.join(" and ") + "."),
@@ -4074,16 +4096,24 @@ function WorkoutsTab(props) {
         h("button", { className: "ex-action-btn", onClick: props.dismissDeloadRecommendation }, "No, train normally")
       )
     ),
-    (props.volumeIncreaseRecommendations || []).map(function (rec) {
-      return h("div", { key: rec.exerciseId, className: "preview-banner", style: { marginBottom: 16 } },
-        h("p", { style: { margin: "0 0 8px" } },
-          "Last phase, " + rec.exerciseName + " (" + titleCaseMuscle(rec.muscle) + ") consistently exceeded its rep range and came back easy or just right most weeks — add a set for the next phase?"),
-        h("div", { style: { display: "flex", gap: 8 } },
-          h("button", { className: "swap-save-btn", style: { flex: 1 }, onClick: function () { props.acceptVolumeIncreaseRecommendation(rec.exerciseId); } }, "Yes, add a set"),
-          h("button", { className: "ex-action-btn", onClick: function () { props.dismissVolumeIncreaseRecommendation(rec.exerciseId); } }, "Not yet")
-        )
-      );
-    }),
+    // Multiple qualifying muscle groups used to render as N separate full-sized banners, each
+    // repeating near-identical framing text — visually monotonous and heavier than the decision
+    // actually warrants. A shared header groups them under one count instead, with each exercise's
+    // own compact row (and its own independent Accept/Dismiss) inside.
+    (props.volumeIncreaseRecommendations || []).length > 0 && h("div", { className: "preview-banner", style: { marginBottom: 16 } },
+      (props.volumeIncreaseRecommendations.length > 1) && h("p", { style: { margin: "0 0 10px", fontWeight: 600 } },
+        props.volumeIncreaseRecommendations.length + " muscle groups are ready for more volume this phase"),
+      props.volumeIncreaseRecommendations.map(function (rec, i) {
+        return h("div", { key: rec.exerciseId, style: i > 0 ? { marginTop: 14, paddingTop: 14, borderTop: "1px solid #2a6d99" } : {} },
+          h("p", { style: { margin: "0 0 8px" } },
+            (props.volumeIncreaseRecommendations.length > 1 ? "" : "Last phase, ") + rec.exerciseName + " (" + titleCaseMuscle(rec.muscle) + ") consistently exceeded its rep range and came back easy or just right most weeks — add a set for the next phase?"),
+          h("div", { style: { display: "flex", gap: 8 } },
+            h("button", { className: "swap-save-btn", style: { flex: 1 }, onClick: function () { props.acceptVolumeIncreaseRecommendation(rec.exerciseId); } }, "Yes, add a set"),
+            h("button", { className: "ex-action-btn", onClick: function () { props.dismissVolumeIncreaseRecommendation(rec.exerciseId); } }, "Not yet")
+          )
+        );
+      })
+    ),
     h("div", { className: "day-tabs" },
       DAYS.map(function (d) {
         return h("button", {
@@ -5356,6 +5386,10 @@ function SettingsTab(props) {
         h("div", { style: { marginTop: 10, borderTop: "1px solid #262626", paddingTop: 10 } },
           h(SettingsRow, null, h("span", { style: { fontSize: 13 } }, "Daily weigh-in"),
             h("input", { type: "time", value: rt.weighIn || "", onChange: function (e) { props.updateReminderTimes({ weighIn: e.target.value }); },
+              style: { background: "#0a0a0a", border: "1px solid #404040", borderRadius: 6, padding: "6px 8px", fontSize: 14, color: "#f5f5f5" } })),
+          h(SettingsRow, null, h("div", null, h("span", { style: { fontSize: 13 } }, "Body-fat check-in"),
+              h("div", { style: { fontSize: 11, color: "#737373", marginTop: 2, maxWidth: 200 } }, "Only fires while this week's Milestones check-in still needs a BF% — stops on its own once you log it")),
+            h("input", { type: "time", value: rt.bfCheckIn || "", onChange: function (e) { props.updateReminderTimes({ bfCheckIn: e.target.value }); },
               style: { background: "#0a0a0a", border: "1px solid #404040", borderRadius: 6, padding: "6px 8px", fontSize: 14, color: "#f5f5f5" } })),
           h(SettingsRow, { style: { borderBottom: "none" } }, h("span", { style: { fontSize: 13 } }, "Training"),
             h("input", { type: "time", value: rt.trainingTime || "", onChange: function (e) { props.updateReminderTimes({ trainingTime: e.target.value }); },
