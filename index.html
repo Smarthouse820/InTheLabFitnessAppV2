@@ -1770,6 +1770,16 @@ function computePhaseWeeks(upToWeek, extraDeloadWeeks) {
   }
   return weeks;
 }
+// How many training weeks remain before the next deload, counting from currentWeek. 0 means
+// currentWeek IS the deload week. Mirrors the same every-5th-week-or-extraDeloadWeeks rule used
+// everywhere else deload weeks are identified, so this never drifts out of sync with them.
+function weeksUntilNextDeload(currentWeek, extraDeloadWeeks) {
+  for (let w = currentWeek, steps = 0; steps < 10; w++, steps++) {
+    const isDeload = w % 5 === 0 || (extraDeloadWeeks || []).indexOf(w) !== -1;
+    if (isDeload) return steps;
+  }
+  return null; // shouldn't happen within 10 weeks given the every-5th-week cadence, but never throw
+}
 // Scores one exercise's performance across a completed phase: how many weeks it was actually
 // trained, how many of those counted as "progressed," and how many were rated easy or just right
 // (never "hard"). Progression normally means hitting/exceeding the fixed rep range's ceiling; when
@@ -2227,6 +2237,28 @@ function getOrCreatePushId() {
   return id;
 }
 
+// ---- Withings integration ----
+// Reuses the same device id push notifications already use — no separate identity needed. The
+// Client ID is public by OAuth2 design (same treatment as VAPID_PUBLIC_KEY); only the Client
+// Secret is sensitive, and that never leaves the Worker.
+const WITHINGS_CLIENT_ID = "43822d764b4993f9cbb9a4d212b2e2e74e580eb21e539007964c967a83ce2e1a";
+
+// Redirects the browser to Withings' own login/consent page — safe to build entirely client-side
+// since only the public Client ID is involved. `state` carries this device's id and the exact URL
+// to return to (this page, stripped of any existing query string) through the OAuth round-trip.
+function connectWithings() {
+  const returnUrl = window.location.origin + window.location.pathname;
+  const state = btoa(JSON.stringify({ id: getOrCreatePushId(), returnUrl: returnUrl }));
+  const params = new URLSearchParams({
+    response_type: "code",
+    client_id: WITHINGS_CLIENT_ID,
+    redirect_uri: PUSH_WORKER_URL + "/withings/callback",
+    scope: "user.metrics",
+    state: state,
+  });
+  window.location.href = "https://account.withings.com/oauth2_user/authorize2?" + params.toString();
+}
+
 // minutes-from-midnight -> "HH:MM" (24h, zero-padded) for the Worker's parseHHMM.
 function minutesToHHMM(mins) {
   const hh = Math.floor(mins / 60), mm = mins % 60;
@@ -2311,7 +2343,7 @@ function buildPushSchedule(data) {
 }
 
 function App() {
-  const APP_VERSION = "2026-07-24T02:00:00";
+  const APP_VERSION = "2026-07-24T15:00:00";
   const [updateAvailable, setUpdateAvailable] = useState(false);
   useEffect(function () {
     function checkVersion() {
@@ -2489,6 +2521,47 @@ function App() {
     if (data.pushSettings && data.pushSettings.enabled) syncPushSchedule(data);
   }, [pushScheduleKey]);
 
+  // ---- Withings ----
+  const [withingsStatus, setWithingsStatus] = useState(null); // null = not yet checked; {connected, latest}
+  function refreshWithingsStatus() {
+    fetch(PUSH_WORKER_URL + "/withings/latest?id=" + getOrCreatePushId())
+      .then(function (r) { return r.json(); })
+      .then(function (json) { setWithingsStatus(json); })
+      .catch(function () { /* leave whatever was last known — a network hiccup shouldn't blank the UI */ });
+  }
+  // Runs once on load: picks up the ?withings=connected|error the OAuth redirect leaves behind,
+  // shows a toast either way, then strips it from the URL so refreshing doesn't re-trigger it —
+  // and pulls the current connection status regardless.
+  useEffect(function () {
+    const params = new URLSearchParams(window.location.search);
+    if (params.has("withings")) {
+      const result = params.get("withings");
+      showToast(result === "connected" ? "Withings connected" : "Withings connection failed — try again");
+      window.history.replaceState(null, "", window.location.pathname);
+    }
+    refreshWithingsStatus();
+  }, []);
+  function disconnectWithings() {
+    fetch(PUSH_WORKER_URL + "/withings/disconnect", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: getOrCreatePushId() }),
+    }).then(function () { setWithingsStatus({ connected: false }); showToast("Withings disconnected"); });
+  }
+  // Applying a synced reading is always an explicit tap, never automatic — same principle as every
+  // other suggestion in this app (deload, volume increase): the person confirms, nothing silently
+  // overwrites what they've logged themselves.
+  function applyWithingsWeighIn() {
+    if (!withingsStatus || !withingsStatus.latest) return;
+    logDailyWeight(Math.round(withingsStatus.latest.weightLb * 10) / 10);
+    showToast("Applied to today's weigh-in");
+  }
+  function applyWithingsMilestone() {
+    if (!withingsStatus || !withingsStatus.latest) return;
+    if (withingsStatus.latest.weightLb != null) setMilestoneActual(prog.currentWeek, "weight", Math.round(withingsStatus.latest.weightLb * 10) / 10);
+    if (withingsStatus.latest.fatRatioPct != null) setMilestoneActual(prog.currentWeek, "bf", Math.round(withingsStatus.latest.fatRatioPct * 10) / 10);
+    showToast("Applied to this week's check-in");
+  }
+
   // Persists manual collapse/expand toggles (Sleep, Supplements box, Your/Unscheduled Supplements)
   // so they stay exactly as left across tab switches, rather than resetting on every remount.
   function updateUiPrefs(patch) {
@@ -2533,6 +2606,12 @@ function App() {
   }
 
   const isDeloadWeek = prog.currentWeek % 5 === 0 || (prog.extraDeloadWeeks || []).indexOf(prog.currentWeek) !== -1;
+  // Digest inputs — reuses the exact same phase/deload logic already driving RIR and volume-increase
+  // elsewhere, so this can never disagree with what those actually do.
+  const phaseWeekPosition = computePhaseWeeks(prog.currentWeek, prog.extraDeloadWeeks).length; // 0 on a deload week itself
+  const weeksToDeload = weeksUntilNextDeload(prog.currentWeek, prog.extraDeloadWeeks);
+  const pendingDeloadRec = !!prog.deloadRecommendation;
+  const pendingVolumeRecCount = (prog.volumeIncreaseRecommendations || []).length;
   const rotationWeek = prog.nutritionRotationWeek || 1;
 
   // Nutrition/grocery rotation advances on real Sunday→Monday boundaries, independent of whatever
@@ -3670,6 +3749,16 @@ function App() {
         ),
         h("p", null, "Week " + prog.currentWeek + " of " + (def.totalWeeks || 15),
           isDeloadWeek && h("span", { style: { color: "#f0b429", fontWeight: "600", marginLeft: "6px" } }, "⚠ DELOAD — sets halved")
+        ),
+        // Phase/week digest — reuses the same phase math already driving RIR and volume-increase, so
+        // it can't disagree with what those actually do. Suppressed on the deload week itself since
+        // "Phase week 0 of 4" would read oddly right next to the DELOAD banner above.
+        h("p", { style: { fontSize: 12, color: "#a3a3a3", margin: "2px 0 0" } },
+          !isDeloadWeek && "Phase week " + phaseWeekPosition + " of " + RIR_PHASE_LENGTH +
+            (weeksToDeload === 0 ? " · deload next week" : weeksToDeload != null ? " · " + weeksToDeload + " to deload" : ""),
+          pendingDeloadRec && h("span", { style: { color: "#f0b429", marginLeft: 8 } }, "\u25c6 Deload suggested"),
+          pendingVolumeRecCount > 0 && h("span", { style: { color: "#4eba6f", marginLeft: 8 } },
+            "\u25c6 " + pendingVolumeRecCount + " volume increase suggestion" + (pendingVolumeRecCount > 1 ? "s" : ""))
         )
       )
     ),
@@ -3756,6 +3845,8 @@ function App() {
               reminderTimes: data.reminderTimes, updateReminderTimes: updateReminderTimes, toggleTrainingDay: toggleTrainingDay,
               isCustomProgram: def.needsSetup === false && data.activeProgram === "custom",
               isSharedProgram: isSharedProgram, activeProgramLabel: def.label, rirModeEnabled: rirModeEnabled, rirModePendingEnable: rirModePendingEnable, toggleRirMode: toggleRirMode,
+              withingsStatus: withingsStatus, connectWithings: connectWithings, disconnectWithings: disconnectWithings,
+              applyWithingsWeighIn: applyWithingsWeighIn, applyWithingsMilestone: applyWithingsMilestone,
               showEditProgramSettings: showEditProgramSettings, setShowEditProgramSettings: setShowEditProgramSettings,
               resetCustomSetup: resetCustomSetup, customProgramConfig: data.customProgramConfig, updateProgramSettings: updateProgramSettings,
               uiPrefs: data.uiPrefs, updateUiPrefs: updateUiPrefs,
@@ -3958,22 +4049,6 @@ function WorkoutsTab(props) {
             className: "ex-action-btn",
             onClick: function () { props.clearWeekSwap(ex.originalExercise.id); },
           }, "Revert to original now"),
-          props.isSharedProgram && !ex.isWeekSubstitute && h("button", {
-            className: "ex-action-btn",
-            onClick: function () {
-              if (window.confirm("Clear saved progress for \"" + displayName + "\"? This resets its weight and rep target back to the program's starting point — shared across Cutting/Cruise/Hypertrophy, so this affects all three. Past logged sets stay in your history untouched; this only resets where you're picking up from.")) {
-                props.clearExerciseHistory(ex.id);
-              }
-            },
-          }, "Clear History"),
-          h("button", {
-            className: "ex-action-btn",
-            onClick: function () {
-              const next = Object.assign({}, muscleEditOpen);
-              next[ex.id] = !next[ex.id];
-              setMuscleEditOpen(next);
-            },
-          }, "Muscle: " + titleCaseMuscle(effectiveMuscle(ex, state))),
           h("button", {
             className: "ex-action-btn", onClick: function () {
               const next = Object.assign({}, historyOpen);
@@ -3981,11 +4056,32 @@ function WorkoutsTab(props) {
               setHistoryOpen(next);
             },
           }, isHistoryOpen ? "Hide history" : "History"),
-          h("a", {
-            className: "ex-action-btn", target: "_blank", rel: "noopener noreferrer",
-            style: { textAlign: "center", textDecoration: "none", display: "block" },
-            href: "https://www.youtube.com/results?search_query=" + encodeURIComponent(ex.name + " exercise form"),
-          }, "Watch Demo")
+          h(ExerciseOverflowMenu, {
+            items: [
+              props.isSharedProgram && !ex.isWeekSubstitute && {
+                label: "Clear History", danger: true,
+                onClick: function () {
+                  if (window.confirm("Clear saved progress for \"" + displayName + "\"? This resets its weight and rep target back to the program's starting point — shared across Cutting/Cruise/Hypertrophy, so this affects all three. Past logged sets stay in your history untouched; this only resets where you're picking up from.")) {
+                    props.clearExerciseHistory(ex.id);
+                  }
+                },
+              },
+              {
+                label: "Muscle: " + titleCaseMuscle(effectiveMuscle(ex, state)),
+                onClick: function () {
+                  const next = Object.assign({}, muscleEditOpen);
+                  next[ex.id] = !next[ex.id];
+                  setMuscleEditOpen(next);
+                },
+              },
+              {
+                label: "Watch Demo",
+                onClick: function () {
+                  window.open("https://www.youtube.com/results?search_query=" + encodeURIComponent(ex.name + " exercise form"), "_blank", "noopener,noreferrer");
+                },
+              },
+            ],
+          })
         ),
         muscleEditOpen[ex.id] && h("div", { style: { marginBottom: 12 } },
           h("p", { style: { fontSize: "11px", color: "#737373", margin: "0 0 6px" } },
@@ -4320,6 +4416,48 @@ function ExerciseNotes(props) {
       className: "exercise-notes-input",
       rows: 2,
     })
+  );
+}
+
+// A small "⋯" button that reveals rarely-used actions (Clear History, Muscle override, Watch
+// Demo) instead of showing every action at full size all the time — those three are things you
+// reach for occasionally (correcting a mis-tag, looking up form, resetting after an injury), not
+// every set, so they don't deserve the same visual weight as Skip/Swap/History. Falsy entries in
+// `items` (e.g. an action that doesn't apply to this program) are simply skipped.
+function ExerciseOverflowMenu(props) {
+  const [open, setOpen] = useState(false);
+  const visibleItems = props.items.filter(Boolean);
+  if (visibleItems.length === 0) return null;
+  return h("div", { style: { position: "relative", flex: "0 0 auto" } },
+    h("button", {
+      className: "ex-action-btn", style: { width: 44, padding: "8px 0", fontSize: 16 },
+      onClick: function (e) { e.stopPropagation(); setOpen(!open); },
+      "aria-label": "More actions",
+    }, "\u22ef"),
+    open && h("div", {
+      onClick: function () { setOpen(false); },
+      style: { position: "fixed", inset: 0, zIndex: 999 },
+    }),
+    open && h("div", {
+      style: {
+        position: "absolute", right: 0, top: "100%", marginTop: 4, background: "#171717",
+        border: "1px solid #404040", borderRadius: 8, minWidth: 190, zIndex: 1000,
+        boxShadow: "0 4px 12px rgba(0,0,0,0.4)", overflow: "hidden",
+      },
+    },
+      visibleItems.map(function (item, i) {
+        return h("button", {
+          key: i,
+          style: {
+            display: "block", width: "100%", textAlign: "left", padding: "10px 14px",
+            background: "none", border: "none",
+            borderBottom: i < visibleItems.length - 1 ? "1px solid #262626" : "none",
+            color: item.danger ? "#f87171" : "#f5f5f5", fontSize: 13, cursor: "pointer",
+          },
+          onClick: function () { setOpen(false); item.onClick(); },
+        }, item.label);
+      })
+    )
   );
 }
 
@@ -4969,6 +5107,12 @@ function MealCard(props) {
   ];
   const likedForMeal = props.likedFoodsForMeal || [];
   const [foodFilter, setFoodFilter] = useState("");
+  // Each food category (Proteins/Carbs/Fats/Vegetables) starts collapsed — the full list can run
+  // long depending on how many foods are in the database, and most of the time someone opening
+  // Customize just wants to see what's already liked, not scroll past every option in every
+  // category. Force-expanded while actively searching, since a collapsed category would otherwise
+  // hide the very results the search was meant to surface.
+  const [expandedFoodCats, setExpandedFoodCats] = useState({});
   const [showRebalance, setShowRebalance] = useState(false);
   const customizeExpanded = !!props.customizeExpanded;
 
@@ -5029,9 +5173,18 @@ function MealCard(props) {
               return f.cat === cat.key && f.name.toLowerCase().indexOf(foodFilter.toLowerCase()) !== -1;
             }).sort(function (a, b) { return a.name.localeCompare(b.name); });
             if (foodFilter && filtered.length === 0) return null; // hide a category with no matches while searching
-            return h("div", { key: cat.key },
-              h("div", { className: "food-cat-title" }, cat.label),
-              h("div", { className: "food-chip-grid" },
+            const likedCountInCat = filtered.filter(function (f) { return likedForMeal.indexOf(f.name) !== -1; }).length;
+            const catOpen = !!foodFilter || !!expandedFoodCats[cat.key];
+            return h("div", { key: cat.key, style: { marginBottom: 4 } },
+              h("button", {
+                onClick: function () { setExpandedFoodCats(Object.assign({}, expandedFoodCats, { [cat.key]: !expandedFoodCats[cat.key] })); },
+                style: { display: "flex", width: "100%", justifyContent: "space-between", alignItems: "center", background: "none", border: "none", padding: "6px 0", cursor: "pointer" },
+              },
+                h("div", { className: "food-cat-title", style: { margin: 0 } },
+                  cat.label + (likedCountInCat > 0 ? " (" + likedCountInCat + " liked)" : "")),
+                catOpen ? h(ChevronUp, { size: 14 }) : h(ChevronDown, { size: 14 })
+              ),
+              catOpen && h("div", { className: "food-chip-grid" },
                 filtered.map(function (f) {
                   const liked = likedForMeal.indexOf(f.name) !== -1;
                   const isCustom = (props.customFoods || []).some(function (c) { return c.name === f.name; });
@@ -5437,15 +5590,29 @@ function SettingsTab(props) {
     ),
 
     // ---- Integrations (placeholder — wearables and smart scale are backlog items, not built) ----
-    h(SettingsSection, { id: "integrations", title: "Integrations", status: "None connected", uiPrefs: props.uiPrefs, updateUiPrefs: props.updateUiPrefs },
+    h(SettingsSection, { id: "integrations", title: "Integrations", status: (props.withingsStatus && props.withingsStatus.connected) ? "Withings connected" : "None connected", uiPrefs: props.uiPrefs, updateUiPrefs: props.updateUiPrefs },
       h(SettingsRow, null, h("div", null,
         h("div", { style: { fontSize: 13 } }, "Wearable (HRV, recovery)"),
         h("div", { style: { fontSize: 11, color: "#737373", marginTop: 2 } }, "Whoop, Oura, Garmin, Apple Watch")),
         h("span", { style: { fontSize: 11, color: "#525252", border: "1px solid #333", borderRadius: 20, padding: "2px 8px" } }, "Coming soon")),
-      h(SettingsRow, { style: { borderBottom: "none" } }, h("div", null,
+      h(SettingsRow, { style: (props.withingsStatus && props.withingsStatus.connected) ? {} : { borderBottom: "none" } }, h("div", { style: { flex: 1, minWidth: 0, paddingRight: 10 } },
         h("div", { style: { fontSize: 13 } }, "Smart scale"),
         h("div", { style: { fontSize: 11, color: "#737373", marginTop: 2 } }, "Withings \u2014 weight and body fat")),
-        h("span", { style: { fontSize: 11, color: "#525252", border: "1px solid #333", borderRadius: 20, padding: "2px 8px" } }, "Coming soon"))
+        (props.withingsStatus && props.withingsStatus.connected)
+          ? h("button", { className: "ex-action-btn", style: { flex: "0 0 auto" }, onClick: props.disconnectWithings }, "Disconnect")
+          : h("button", { className: "ex-action-btn", style: { flex: "0 0 auto", background: "#1d4ed8", color: "#fff", borderColor: "#1d4ed8" }, onClick: props.connectWithings }, "Connect")),
+      props.withingsStatus && props.withingsStatus.connected && props.withingsStatus.latest && h("div", { style: { borderBottom: "none", padding: "10px 0 0" } },
+        h("p", { style: { fontSize: 11, color: "#737373", margin: "0 0 8px" } },
+          "Last synced: " + (props.withingsStatus.latest.weightLb != null ? Math.round(props.withingsStatus.latest.weightLb * 10) / 10 + " lb" : "") +
+          (props.withingsStatus.latest.fatRatioPct != null ? " \u00b7 " + Math.round(props.withingsStatus.latest.fatRatioPct * 10) / 10 + "% BF" : "") +
+          " \u2014 nothing applies automatically, tap below to use it"),
+        h("div", { style: { display: "flex", gap: 8, flexWrap: "wrap" } },
+          h("button", { className: "ex-action-btn", style: { flex: "1 1 45%" }, onClick: props.applyWithingsWeighIn }, "Use for today's weigh-in"),
+          h("button", { className: "ex-action-btn", style: { flex: "1 1 45%" }, onClick: props.applyWithingsMilestone }, "Use for this week's check-in")
+        )
+      ),
+      props.withingsStatus && props.withingsStatus.connected && !props.withingsStatus.latest && h("p", { style: { fontSize: 11, color: "#737373", margin: "10px 0 0" } },
+        "Connected — waiting on your first reading from the scale.")
     ),
 
     // ---- Display ----
